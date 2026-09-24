@@ -1,0 +1,36 @@
+# One-blueprint deploy (the blessed path — INSTALL.md walks a coding agent through it).
+services:
+  - type: web
+    name: verity-meetings
+    runtime: node
+    plan: starter
+    buildCommand: "echo no-build"
+    startCommand: node booking/server.mjs
+    healthCheckPath: /healthz
+    envVars:
+      - key: BOOKING_ENABLED
+        value: "1"
+      - key: BOOKING_PUBLIC_URL
+        sync: false
+      - key: BOOKING_HOSTS
+        sync: false
+      - key: COMPANY_NAME
+        sync: false
+      - key: AGENT_NAME
+        sync: false
+      - key: BOOKING_TYPES_BLOCK_SLUG
+        sync: false
+      - key: SCHEDULE_CONFIG_BLOCK_SLUG
+        sync: false
+      - key: NOAN_AGENT_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: GOOGLE_SA_JSON
+        sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: MAIL_FROM
+        sync: false

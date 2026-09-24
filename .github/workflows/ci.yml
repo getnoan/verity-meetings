@@ -1,0 +1,38 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: syntax
+        run: for f in $(find booking agents scripts -name '*.mjs'); do node --check "$f" || exit 1; done
+      - name: tests
+        run: for t in agents/test-*.mjs; do echo "== $t"; node "$t" || exit 1; done
+      - name: dry-run boot (no keys — the INSTALL.md quickstart, verified on every push)
+        run: |
+          BOOKING_ENABLED=1 BOOKING_STORE=memory BOOKING_DRY_RUN=1 \
+          BOOKING_HOSTS=founder@example.com,teammate@example.com \
+          BOOKING_PUBLIC_URL=http://127.0.0.1:8671 PORT=8671 \
+          node booking/server.mjs & sleep 3
+          test "$(curl -s http://127.0.0.1:8671/healthz)" = "ok"
+          curl -s http://127.0.0.1:8671/alex | grep -qi "<!doctype html"
+          curl -s http://127.0.0.1:8671/alex | grep -q "Intro Call"
+  # Its own job: it needs the PR's base commit, and it answers "will the next export
+  # revert this?" — a contributor should get that without waiting on the build.
+  provenance:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # HEAD is the PR merge commit; depth 2 makes HEAD^1 (the base tip) resolvable.
+        with: { fetch-depth: 2 }
+      - uses: actions/setup-node@v4
+        with: { node-version: "22" }
+      - name: export provenance
+        env:
+          PR_HEAD_REF: ${{ github.head_ref }}
+        run: node scripts/check-provenance.mjs

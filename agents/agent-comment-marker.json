@@ -1,0 +1,60 @@
+{
+  "_readme": [
+    "How an agent's own task comment says so, in a way the agent can recognise when it",
+    "reads the board back. Compiled by agents/agent-comment.mjs and design/agent_comment.py",
+    "from these very strings, so the two languages cannot drift — the same reason",
+    "comment-grammar.json exists, and the drift it prevents is worse here: a marker the",
+    "reader fails to recognise turns the agent's own status note into a teammate's",
+    "instruction.",
+    "",
+    "WHY A MARKER AND NOT THE AUTHOR. Until 2026-09-18 a comment carried",
+    "`createdByAssistant` and the server said who wrote it. That field is gone; a comment",
+    "is now attributed to the owner of the API key that posted it. A deployment whose",
+    "agents run under a human's key — measured to be every key in this fleet, and the",
+    "default for anyone installing the pack, since NOAN has no service accounts — cannot",
+    "tell its own comments from that person's by author alone. So the comment says it",
+    "itself.",
+    "",
+    "FAIL-SAFE BY SHAPE, VERIFIED BY SIGNATURE. Recognition is the shape of the",
+    "signature line, NOT whether the HMAC checks out. The two failure directions are not",
+    "symmetric: an unrecognised agent comment is read as human steering (dangerous), while",
+    "a wrongly-recognised human comment is merely dropped (annoying). Shape-matching fails",
+    "in the harmless direction even when the secret is missing or rotated, which a",
+    "verify-to-recognise rule would not. The HMAC's job is to catch tampering and config",
+    "drift and say so loudly — not to gate recognition.",
+    "",
+    "AN UNSIGNED COMMENT IS STILL A MARKED COMMENT. Where no secret is configured the",
+    "signature reads `unsigned` and the line is still written, because the alternative —",
+    "emitting no line at all — makes an agent comment UNRECOGNISABLE, which is the",
+    "dangerous direction the shape rule exists to avoid. The first cut of this file got",
+    "that wrong: it failed safe on a WRONG secret but not on a MISSING one.",
+    "",
+    "The signature binds the body AND the task id, so a comment copied onto another task",
+    "no longer verifies. A verbatim replay onto the SAME task still verifies, which is",
+    "harmless: it is classified as the agent's own and ignored.",
+    "",
+    "Patterns use only syntax both engines read identically: (?:...), \\s, \\n, [0-9a-f].",
+    "No named groups, no lookbehind."
+  ],
+
+  "version": 1,
+
+  "label_suffix": " · agent status",
+  "_label_note": [
+    "Prepended as a first line, '<AGENT_NAME>· agent status', so a human reading the",
+    "board can see who wrote it. Necessary because creator.name now shows the key",
+    "owner's name — a person's name — on every agent comment.",
+    "The agent's name comes from AGENT_NAME at call time, never a literal here."
+  ],
+
+  "signature_template": "⟦agent:v1:{sig}⟧",
+  "signature_pattern": "\\n⟦agent:v1:(?:[0-9a-f]{16}|unsigned)⟧[\\s]*$",
+  "unsigned_sig": "unsigned",
+
+  "sign": {
+    "algorithm": "sha256",
+    "digest_chars": 16,
+    "secret_env": "AGENT_COMMENT_SECRET",
+    "_payload_note": "HMAC over taskId + \"\\n\" + body, where body is the comment text with the signature line and trailing whitespace removed."
+  }
+}

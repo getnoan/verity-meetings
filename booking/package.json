@@ -1,0 +1,11 @@
+{
+  "name": "verity-booking",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Booking pages that write to the fact layer and hand every booking to the agents",
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}

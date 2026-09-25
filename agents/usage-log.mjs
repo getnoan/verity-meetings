@@ -36,7 +36,12 @@ export const PRICING = {
     "claude-sonnet-4-6": { in: 3, out: 15 },
     "claude-haiku-4-5":  { in: 1, out: 5 },
   },
-  elevenlabs: { perUnit: 0.00022 },  // ~Creator tier $/char
+  // ~Creator tier $/char at list. An install on a grant or a flat plan sets
+  // ELEVENLABS_USD_PER_CHAR (0 for a grant) and the ledger keeps the
+  // characters (units) without inventing dollars; a list-price estimate on
+  // a free plan once made up most of a voice surface's "spend" and tripped
+  // its daily budget shutoff (2026-09-24).
+  elevenlabs: { perUnit: process.env.ELEVENLABS_USD_PER_CHAR !== undefined ? parseFloat(process.env.ELEVENLABS_USD_PER_CHAR) || 0 : 0.00022 },
   firecrawl:  { perUnit: 0.001 },    // ~1 credit per scrape/search
   resend:     { perUnit: 0.0004 },   // flat plan amortized; pure estimate
   // X pay-per-use reads vary by kind ($0.001 owned reads → $0.01 user reads),
@@ -163,6 +168,17 @@ export async function recordUsage({ agent, action, provider, model, usage, units
  * 1000-row pages. THROWS on error — only spend-worker calls this, and a failed
  * report should alert, not silently report zero spend.
  */
+/** What a ledger row costs at TODAY's rates. Stored cost_usd is an estimate
+ *  frozen at write time; a metered provider whose rate is set by env
+ *  (ELEVENLABS_USD_PER_CHAR: 0 on a grant) is re-priced from its units, so a
+ *  daily budget never locks a surface over an estimate the rate has since
+ *  corrected (2026-09-24: a day of list-priced renders kept a surface shut
+ *  after the rate went to zero). Everything else keeps its stored cost. */
+export function rowCost(row) {
+  if (row?.provider === "elevenlabs" && row.units != null) return (parseFloat(row.units) || 0) * PRICING.elevenlabs.perUnit;
+  return parseFloat(row?.cost_usd) || 0;
+}
+
 export async function readUsage({ since, until } = {}) {
   const base = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY;

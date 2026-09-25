@@ -101,8 +101,21 @@ function tag(err, status, payload) {
   return err;
 }
 
+/** The request URL for a path, or for an absolute URL — which must be on the API's own origin.
+ *  Every call carries the NOAN key, so an absolute URL on any other host would hand the key to
+ *  whoever controls that host. Nothing in the fleet passes one today (noanGetAll deliberately
+ *  never follows links.next), so this refuses what should not happen rather than changing what
+ *  does; CodeQL js/request-forgery flagged it where a public chat service calls into here. */
+export function noanUrl(path) {
+  if (!/^https?:/i.test(path)) return `${BASE}${path}`;
+  if (new URL(path).origin !== new URL(BASE).origin) {
+    throw new Error(`noan: refusing to send the NOAN key to ${new URL(path).origin} — only ${new URL(BASE).origin} is the API`);
+  }
+  return path;
+}
+
 async function call(method, path, body, { retries = 4 } = {}) {
-  const url = path.startsWith("http") ? path : `${BASE}${path}`;
+  const url = noanUrl(path);
   // Build the headers ONCE, and OUTSIDE the try below. Still per request, so an
   // agent that sets NOAN_AGENT_API_KEY before its first call is honoured — but
   // no longer per ATTEMPT, and no longer inside the catch that retries.

@@ -1,5 +1,9 @@
 name: ci
 on: [push, pull_request]
+# Read-only, stated rather than inherited: nothing here writes to the repo, and a repository
+# whose default token was ever widened would otherwise hand that to every job.
+permissions:
+  contents: read
 jobs:
   build:
     runs-on: ubuntu-latest

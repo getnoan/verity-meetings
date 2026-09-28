@@ -82,6 +82,30 @@ export function registryEntry(tagName) {
   return TRIGGER_TAG_REGISTRY.find(e => e.tag.toLowerCase() === t) || null;
 }
 
+/** Whether a registered trigger's enable switch is on, as far as THIS process can see:
+ *  "on" (no gate, or the gate reads "1"), "off" (the gate variable is present and is anything
+ *  else), or "unknown" (gated, and the variable is not in this environment at all).
+ *
+ *  "unknown" is deliberately not "off". Until 2026-09-25 no workflow that routes or audits work
+ *  (general-worker, board-sweep) was passed a single *_ENABLED variable, so treating absence as
+ *  off would have refused every gated route the day this shipped. The workflows now pass the
+ *  registry's gates (see GATE_VARS); a local run without them keeps the old behaviour.
+ *  The failure this separates out: Partner Brief is routable, PARTNER_BRIEFS_ENABLED is 0, and
+ *  the NOAN tag was never created, so a route to it was tagged with nothing and told the
+ *  requester the partner agent "will email the customer" while that agent does not run. */
+export function gateState(entry, env = process.env) {
+  if (!entry?.gate) return "on";
+  const v = env[entry.gate];
+  // Empty counts as absent: `${{ vars.X }}` renders "" when the repo variable is not defined (a
+  // fork, a fresh install), and reading that as "off" would refuse the route on a guess.
+  if (v === undefined || String(v).trim() === "") return "unknown";
+  return String(v).trim() === "1" ? "on" : "off";
+}
+
+/** Every enable switch the registry names. A workflow that routes to, or audits, these triggers
+ *  must pass each one in its env, or a switched-off specialist reads as "unknown" there. */
+export const GATE_VARS = [...new Set(TRIGGER_TAG_REGISTRY.map(e => e.gate).filter(Boolean))];
+
 /* ---------------- pipeline records ----------------
  * Some tasks on the board are STATE, not work. The company website's site-preview
  * magnet (site-preview.functions.ts captureLead) opens one task per preview,

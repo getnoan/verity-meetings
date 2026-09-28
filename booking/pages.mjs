@@ -14,7 +14,7 @@
  * is external copy.
  */
 import { createHash } from "node:crypto";
-import { siteHeader, siteFooter } from "./site-chrome.mjs";
+import { siteHeader, siteFooter, siteCallout } from "./site-chrome.mjs";
 import { agentName } from "../agents/required-env.mjs";
 import { FIELD_JS } from "./field.mjs";
 
@@ -112,6 +112,7 @@ ${iconLinks}
 <body>
 ${siteHeader({ overlay: hero })}
 ${hero ? heroBand(body) : `<div class="page site-wrap">\n${body}\n</div>`}
+${siteCallout()}
 ${siteFooter()}
 ${boot ? `<script type="application/json" id="boot">${json(boot)}</script>\n` : ""}<script src="/assets/app.js?v=${ASSET_VERSION}" defer></script>
 ${hero ? `<script src="/assets/field.js?v=${ASSET_VERSION}" defer></script>` : ""}
@@ -359,6 +360,16 @@ label{display:grid;gap:7px;font-size:.92rem;font-weight:500}
 .done .when{font-family:var(--font-display);text-transform:uppercase;font-size:clamp(1.6rem,1.3rem + 1.4vw,2.2rem);line-height:1.05}
 .done a{color:#ffb48a;text-underline-offset:3px}
 .empty{color:var(--muted);font-size:.92rem}
+
+/* open-source callout (site-chrome siteCallout) */
+.oss{border-top:1px solid var(--rule);background:rgb(var(--ivory) / .02)}
+.oss-in{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:24px;padding-block:28px}
+.oss-copy{max-width:44rem}
+.oss-eyebrow{font:500 11px/1 var(--font-mono);letter-spacing:.18em;text-transform:uppercase;color:rgb(var(--teal) / .9)}
+.oss-line{margin-top:10px;font-size:15px;line-height:1.5;color:var(--ink)}
+.oss-line strong{font-weight:500}
+.oss-sub{margin-top:6px;font-size:13px;line-height:1.6;color:var(--muted)}
+.oss-cta{flex:none}
 
 /* footer (site Footer.tsx) */
 .site-footer{border-top:1px solid var(--rule);background:var(--ground)}

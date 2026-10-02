@@ -27,6 +27,10 @@ const DETAILS_MAX = 2000;
 
 export const BRIEF_TAG = "Pre-call Brief";
 
+/** From this attempt on, book() creates the guest's contact even when the lookup never settled.
+ *  Must stay below core.mjs MAX_ATTEMPTS, or a booking parks for a human over a lookup. */
+export const CREATE_ON_UNSETTLED_AFTER = 3;
+
 export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZone = "Europe/Lisbon", publicUrl = "", log = console.log, dispatch = async () => false } = {}) {
   const tz = () => timeZone;
 
@@ -161,9 +165,21 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
   async function book(row, type, remember) {
     let contactId = row.noan_contact_id;
     if (!contactId) {
-      // allowIncompleteSweep, as site-web does for live visitors: a person just booked, and a
-      // rare duplicate (merged by the weekly network-integrity run) beats a lost booking.
-      const { contact } = await api.findOrCreateContactByEmail(row.guest_email, { name: row.guest_name, allowIncompleteSweep: true });
+      // A miss from a sweep that never settled is not an absence, and a wrong create is permanent
+      // (no DELETE /contacts). So the early attempts REFUSE and throw: the guest already has their
+      // calendar invite (it is settled before this queue runs), and the sweeper retries this item
+      // every 10 minutes, each time on a fresh sweep that usually does settle. Only from
+      // CREATE_ON_UNSETTLED_AFTER does it create anyway, so a lookup that never settles still
+      // files the contact before MAX_ATTEMPTS (5) parks the booking for a human.
+      //
+      // This was `allowIncompleteSweep: true` on every attempt — "a rare duplicate beats a lost
+      // booking". But nothing is lost by waiting, and the duplicate is not rare in effect: it
+      // takes the booking memos, the meeting task and the booking row's contact id with it, all
+      // of which have to be moved by hand before it can be deleted (Caroline Hoste, 2026-09-28).
+      const { contact } = await api.findOrCreateContactByEmail(row.guest_email, {
+        name: row.guest_name,
+        allowIncompleteSweep: (row.attempts || 0) >= CREATE_ON_UNSETTLED_AFTER,
+      });
       contactId = contact.id;
       await remember({ noan_contact_id: contactId });
     }

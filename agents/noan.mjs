@@ -75,6 +75,44 @@ function assertNoDowngrade() {
   }
 }
 
+/** NOAN_EXPECT_BOT=1: this run's key must belong to the NOAN agent (role bot).
+ *
+ *  NOAN_REQUIRE_AGENT_KEY only proves a key is PRESENT. Once a workspace's
+ *  keys belong to its agent identity, the failure left is a secret re-set with
+ *  a person's key: everything works, and every comment and fact is attributed
+ *  to that person again, silently. A workflow sets this once its key is the
+ *  agent's, and the run then refuses to start on anything else.
+ *
+ *  One GET /me per key per process, memoised INCLUDING a failure, so an outage
+ *  costs one request rather than one per call. Fails closed: an unreachable
+ *  /me is not a reason to write under an unconfirmed identity. It uses fetch
+ *  directly because call() is what it guards. A revoked key answers 403
+ *  "Invalid API Key", not 401, so both mean a bad key. */
+const _expectBot = new Map();
+function expectBot(key) {
+  if (!_expectBot.has(key)) {
+    _expectBot.set(key, (async () => {
+      let res;
+      try { res = await fetch(`${BASE}/me`, { headers: { Authorization: `Bearer ${key}` } }); }
+      catch (e) { throw tag(new Error(`NOAN_EXPECT_BOT=1 but GET /me could not be reached (${e.message}); refusing to run under an unconfirmed identity`), null); }
+      let me = null; try { me = JSON.parse(await res.text()); } catch { /* reported below */ }
+      if (res.status === 401 || res.status === 403) {
+        throw tag(new Error(`NOAN_EXPECT_BOT=1 but the key was rejected (${res.status} ${me?.message || ""}); it is revoked, mistyped or not a NOAN key`), res.status, me);
+      }
+      if (!res.ok) throw tag(new Error(`NOAN_EXPECT_BOT=1 but GET /me returned ${res.status}; refusing to run under an unconfirmed identity`), res.status, me);
+      const role = me?.identity?.role || null;
+      if (role !== "bot") {
+        throw tag(new Error(
+          `NOAN_EXPECT_BOT=1 but this key belongs to ${me?.identity?.email || me?.identity?.id || "an unknown identity"} (role ${role || "none"}), ` +
+          "not the workspace's agent. Everything it wrote would be attributed to that person. Mint the key under the " +
+          "agent (Settings → API → Agent API Keys) and put it in the workflow's secret, or unset NOAN_EXPECT_BOT if a person's key is intended."), 403, me);
+      }
+      return me;
+    })());
+  }
+  return _expectBot.get(key);
+}
+
 function headers() {
   assertNoDowngrade();
   const key = noanKey();
@@ -127,6 +165,7 @@ async function call(method, path, body, { retries = 4 } = {}) {
   // that into a 174s unit-test run. Same class of mistake as reporting a 403
   // MissingPermission as a retryable blip: a config error must fail on the spot.
   const hdrs = headers();
+  if (process.env.NOAN_EXPECT_BOT === "1") await expectBot(noanKey());
   for (let attempt = 0; ; attempt++) {
     let res;
     try {
@@ -509,6 +548,7 @@ export async function agentIdentityCheck() {
   _identityCheck = {
     ok: !!(id && known.includes(id)),
     id, email: me?.identity?.email || null, name: me?.identity?.name || null,
+    role: me?.identity?.role || null,
     project: me?.project?.name || null, known, error,
   };
   return _identityCheck;
@@ -534,7 +574,34 @@ export async function assertAgentIdentity(what = "this write") {
     "agent marker, so a comment written with this key would be read back as that person's " +
     "own words and would reach the approval gates. Fix by pointing the workflow at the " +
     "agent's own key, or by adding this identity to AGENT_IDENTITY_IDS if it IS the agent. " +
-    "agents/check-noan-identity.mjs reports what a key resolves to.");
+    "GET /me with the key reports what it resolves to (identity.id, identity.role).");
+}
+
+/** Is this identity the agent rather than a person? The platform's agent
+ *  role is `bot` (GET /me carries it; the API gives the agent no email). Task
+ *  assignees and comment authors carry no role, so there the agent is
+ *  recognised by id (AGENT_IDENTITY_IDS), as is a person-role seat standing in
+ *  for it. Either is enough. */
+export function isAgentIdentity({ id = null, role = null } = {}) {
+  if (role === "bot") return true;
+  return !!id && agentIdentityIds().includes(id);
+}
+
+/** Who the key belongs to, for code that acts on GET /me's identity.
+ *
+ *  A key used to be a PERSON's, so "the key's own identity" meant a human:
+ *  fact alignment self-assigned its review to it, the grounding check filed
+ *  gaps to it, the task worker fell back to its address as the requester.
+ *  When a key belongs to the agent identity instead, each of those would hand
+ *  work to the agent itself, or make an undeliverable address the requester.
+ *  So `human` is the identity only when it is a person; callers fall through
+ *  to their configured human when it is null. `isAgent` is false when /me
+ *  failed, so a caller can tell "the agent" from "unknown". */
+export async function keyIdentity() {
+  const c = await agentIdentityCheck();
+  const known = !c.error && !!c.id;
+  const isAgent = known && isAgentIdentity(c);
+  return { ...c, isAgent, human: known && !isAgent ? { id: c.id, email: c.email, name: c.name } : null };
 }
 
 let _companyName;   // undefined = not fetched yet; "" = fetched, nothing usable

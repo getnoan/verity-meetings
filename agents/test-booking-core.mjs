@@ -8,7 +8,7 @@ import assert from "node:assert";
 import { createBookingCore, hashToken, MAX_ATTEMPTS } from "../booking/core.mjs";
 import { createFakeCalendar } from "../booking/fake-calendar.mjs";
 import { createMemoryStore } from "../booking/store-memory.mjs";
-import { createNoanCrm } from "../booking/noan-sync.mjs";
+import { createNoanCrm, CREATE_ON_UNSETTLED_AFTER } from "../booking/noan-sync.mjs";
 import { ics } from "../booking/alerts.mjs";
 import { parseScheduleFact } from "./slots.mjs";
 import { parseBookingTypes } from "./booking-types.mjs";
@@ -592,6 +592,44 @@ blocked dates: christmas
   assert.equal((await closed.slots("neal", "demo", "2026-09-22")).slots.length, 0, "their own day off closes the page");
   assert((await closed.slots("neal", "demo", "2026-09-24")).slots.length > 0, "the next day is open");
   ok("a type's own `blocked dates:` closes that host's days, not the config owner's");
+}
+
+
+/* ========= a contact lookup that never settled does not create, until late ========= */
+{
+  // Caroline Hoste, 2026-09-28: a booking's contact was a duplicate of a customer already on
+  // file. That one came from the retired Lovable app, but this path created on ANY unsettled
+  // miss too. Now the early attempts refuse; the sweeper retries; only a late attempt creates.
+  assert.ok(CREATE_ON_UNSETTLED_AFTER < MAX_ATTEMPTS, "must create before the booking parks for a human");
+  const noan = fakeNoan();
+  const seen = [];
+  const settled = { now: false };
+  const inner = noan.api.findOrCreateContactByEmail;
+  noan.api.findOrCreateContactByEmail = async (email, opts) => {
+    seen.push(!!opts.allowIncompleteSweep);
+    if (!settled.now && !opts.allowIncompleteSweep) {
+      const e = new Error(`refusing to create a contact for ${email}: sweep never settled`);
+      e.code = "INCOMPLETE_CONTACT_SWEEP";
+      throw e;
+    }
+    return inner(email, opts);
+  };
+  const crm = createNoanCrm({ api: noan.api, verityId: VERITY, timeZone: avail.timeZone });
+  const row = { id: "b1", guest_email: "unsettled@example.com", guest_name: "G", start_at: "2026-09-16T16:30:00Z",
+                end_at: "2026-09-16T17:00:00Z", answers: [], attempts: 0 };
+  const type = TYPES.types[0];
+  await assert.rejects(crm.apply(row, type, { kind: "book" }), /refusing to create/);
+  assert.equal(noan.db.contacts.size, 0, "an unsettled miss on a first attempt creates nothing");
+  assert.equal(seen[0], false, "and it did not ask for the incomplete-sweep override");
+  await assert.rejects(crm.apply({ ...row, attempts: CREATE_ON_UNSETTLED_AFTER - 1 }, type, { kind: "book" }), /refusing/);
+  assert.equal(noan.db.contacts.size, 0, "nor on the attempt before the cut-over");
+  await crm.apply({ ...row, attempts: CREATE_ON_UNSETTLED_AFTER }, type, { kind: "book" });
+  assert.equal(noan.db.contacts.size, 1, "a late attempt files the contact rather than parking the booking");
+  settled.now = true; seen.length = 0;
+  const other = { ...row, id: "b2", guest_email: "settled@example.com" };
+  await crm.apply(other, type, { kind: "book" });
+  assert.equal(noan.db.contacts.size, 2, "a SETTLED miss still creates on the first attempt: new guests are not delayed");
+  ok("an unsettled contact lookup retries instead of creating, until a late attempt");
 }
 
 console.log("\nbooking core: all passed");

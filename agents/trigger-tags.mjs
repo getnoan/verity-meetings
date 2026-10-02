@@ -29,7 +29,8 @@ export const TRIGGER_TAG_REGISTRY = [
   { tag: "reengage",   worker: "reengage-worker.mjs",                 customerFacing: true },
   { tag: "activation", worker: "activation-worker.mjs",               customerFacing: true },
   { tag: "course offer", worker: "course-worker.mjs (runOfferBeat)",  customerFacing: true },
-  { tag: "trial",      worker: "trial-worker.mjs",                    customerFacing: true },
+  // "trial" was retired 2026-09-29 with the trial-conversion agent: NOAN offers no trials, its
+  // workflow is archived, and a route to it would be a dead one.
   { tag: "support",    worker: "reply-worker.mjs (scanSupportTasks)", customerFacing: false },
   { tag: "Social",     worker: "social-worker.mjs",                   customerFacing: false },
   { tag: "LinkedIn",   worker: "linkedin-worker.mjs",                 customerFacing: false },
@@ -257,7 +258,7 @@ export function looksLikeBackfill(backfillCount, limit = SURGE_LIMIT) {
 export const AUTOMATION_BEARING_CONTACT_TAGS = {
   "subscriber":      "arms the autonomous onboarding welcome and support/course/activation eligibility, and cancels queued follow-ups",
   "free":            "arms the autonomous onboarding welcome and the agent-ideas and course beats, exactly as Subscriber does — the free tier is a user, not a prospect",
-  "trial":           "enters them in the trial-conversion sweep (code-guarded emails) and cancels queued follow-ups",
+  "trial":           "cancels queued follow-ups (the trial-conversion sweep it once armed is retired)",
   "investor":        "grants investor voice-surface access and standing digests (with an active passcode)",
   "target investor": "admits them to the investor OTP gate",
   "demo booked":     "marks them awaiting a demo; a sales demo memo then retags Demo Done and queues a deck",

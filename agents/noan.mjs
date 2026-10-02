@@ -105,7 +105,7 @@ function expectBot(key) {
         throw tag(new Error(
           `NOAN_EXPECT_BOT=1 but this key belongs to ${me?.identity?.email || me?.identity?.id || "an unknown identity"} (role ${role || "none"}), ` +
           "not the workspace's agent. Everything it wrote would be attributed to that person. Mint the key under the " +
-          "agent (Team > Agent > API keys) and put it in the workflow's secret, or unset NOAN_EXPECT_BOT if a person's key is intended."), 403, me);
+          "agent (Settings → API → Agent API Keys) and put it in the workflow's secret, or unset NOAN_EXPECT_BOT if a person's key is intended."), 403, me);
       }
       return me;
     })());

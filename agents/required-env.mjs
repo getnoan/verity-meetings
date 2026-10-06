@@ -104,10 +104,14 @@ export function linkRule() {
 }
 
 /** How prose refers to the agent. AGENT_PRONOUNS "she/her", "he/him" or
- *  anything else (they/them, the default and the neutral reading). */
+ *  anything else (they/them, the default and the neutral reading).
+ *  `verb(base)` agrees a regular verb with the subject: "she picks", "they pick". Write every
+ *  verb after `subj` through it; a hard-coded "picks" read "they picks it up" in every pack
+ *  customer's escalations until 2026-10-02. */
 export function pronouns() {
   const v = (process.env.AGENT_PRONOUNS || "").trim().toLowerCase();
-  if (v.startsWith("she")) return { subj: "she", obj: "her", poss: "her" };
-  if (v.startsWith("he")) return { subj: "he", obj: "him", poss: "his" };
-  return { subj: "they", obj: "them", poss: "their" };
+  const third = verb => `${verb}s`;
+  if (v.startsWith("she")) return { subj: "she", obj: "her", poss: "her", verb: third };
+  if (v.startsWith("he")) return { subj: "he", obj: "him", poss: "his", verb: third };
+  return { subj: "they", obj: "them", poss: "their", verb: verb => verb };
 }

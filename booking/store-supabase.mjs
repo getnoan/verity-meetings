@@ -66,6 +66,14 @@ export function createSupabaseStore({ url = process.env.SUPABASE_URL, key = proc
       return Array.isArray(rows) ? rows.length : 0;
     },
 
+    /** Confirmed bookings with a task whose meeting ended in [fromISO, toISO), oldest first.
+     *  The "not touched since it ended" test compares two columns, which PostgREST can't, so
+     *  core.mjs applies it to what this returns. */
+    listEnded: (fromISO, toISO, limit = 50) => call("GET", `${TABLE}?${q({
+      status: "eq.confirmed", noan_task_id: "not.is.null", and: `(end_at.gte.${fromISO},end_at.lt.${toISO})`,
+      select: "id,status,end_at,noan_task_id,noan_queue,noan_synced_at", order: "end_at.asc", limit: String(limit),
+    })}`),
+
     listPending: (limit = 25) => call("GET", `${TABLE}?${q({
       or: "(calendar_synced_at.is.null,noan_queue.neq.[])", order: "created_at.asc", limit: String(limit),
     })}`),

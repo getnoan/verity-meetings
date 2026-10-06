@@ -23,6 +23,16 @@ const CLIENT = existsSync(p("./google-oauth-client.json"))
 const TOKEN = existsSync(p("./google-token.json"))
   ? JSON.parse(readFileSync(p("./google-token.json"))) : null;
 
+/** The secret a pack user adds to turn this on (CI writes it to google-service-account.json). */
+export const CALENDAR_SECRET = "GOOGLE_SERVICE_ACCOUNT_JSON";
+
+/**
+ * Is there a Google credential at all? The agent pack ships the scheduling lane to people
+ * who may never connect a calendar, and without one every call below throws. Callers check
+ * this first and say "not configured yet" once, rather than failing on each email.
+ */
+export function calendarConfigured() { return !!(SA || (CLIENT && TOKEN)); }
+
 const SCOPES = "https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.freebusy";
 /** Asked for ONLY by userTimeZone, and on its own token: a delegation that does not carry
  *  this scope refuses the whole token request, and booking and scheduling must not go down

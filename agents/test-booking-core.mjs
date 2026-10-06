@@ -14,6 +14,8 @@ import { parseScheduleFact } from "./slots.mjs";
 import { parseBookingTypes } from "./booking-types.mjs";
 import { DEFAULT_TRIGGER_TAGS } from "./trigger-tags.mjs";
 import { sanitizeCopy } from "./noan.mjs";
+import { buildAgentComment } from "./agent-comment.mjs";
+import { HELD_GRACE_MS } from "../booking/core.mjs";
 import { FACT as SCHEDULE_FACT } from "./seed-scheduling.mjs";
 
 const ok = (name) => console.log("  ok  ", name);
@@ -113,7 +115,14 @@ function fakeNoan() {
     async appendTaskNote(id, text) { const t = db.tasks.get(id); t.details += `\n[agent] ${text}`; },
     // A comment does NOT touch details — that is the point of the move, so the
     // fake must not quietly keep appending to them.
-    async postTaskComment(id, text) { const t = db.tasks.get(id); (t.comments ||= []).push({ id: `c${t.comments?.length || 0}`, content: text }); },
+    // Marked, like the real postTaskComment: the held close tells the agent's own notes from a person's.
+    async postTaskComment(id, text) { const t = db.tasks.get(id); (t.comments ||= []).push({ id: `c${t.comments?.length || 0}`, content: buildAgentComment(text, id) }); },
+    // The open board, as the held close reads it.
+    async noanGetAll(path) {
+      if (path === "/contacts?per_page=100") return [...db.contacts.values()].map(c => structuredClone(c));
+      if (path !== "/tasks?completed=false&per_page=100") throw new Error(`fake noanGetAll ${path}`);
+      return [...db.tasks.values()].filter(t => !t.completed).map(t => structuredClone(t));
+    },
     async findTaskById(id) { return structuredClone(db.tasks.get(id)); },
     async assignVerity(task) { db.tasks.get(task.id).assignees.push({ id: VERITY }); },
   };
@@ -446,6 +455,107 @@ const tokenOf = url => url.split("/manage/")[1];
   ok("a call that never answers becomes a recorded failure: the lock frees, the sweeper moves on, the retry completes it");
 }
 
+/* ================= a held meeting closes its task ================= */
+{
+  // Nothing closed a held meeting's task: on 2026-10-02 twelve sat open on the board, five of
+  // them in duplicate pairs. The sweeper now queues a `held` item once the meeting has ended.
+  const at = clock;
+  const h = harness();
+  const b = await h.book(demo());
+  const [row] = await h.store.listConfirmedBetween(HOST, TUE_0900, TUE_1400);
+  await h.core._syncNoan(row.id);
+  const taskId = (await h.store.get(row.id)).noan_task_id;
+  const task = () => h.noan.db.tasks.get(taskId);
+
+  clock = Date.parse(row.end_at) + HELD_GRACE_MS - 60_000;   // ended, but inside the grace
+  await h.core.sweep();
+  assert.equal(task().status, "backlog", "not inside the grace hour");
+
+  clock = Date.parse(row.end_at) + HELD_GRACE_MS + 60_000;
+  const s = await h.core.sweep();
+  assert.equal(s.held, 1);
+  assert.equal(task().status, "done");
+  assert.equal(task().completed, true, "both fields, never one");
+  assert.match(task().comments.at(-1).content, /This meeting has taken place/);
+  assert.equal((await h.core.sweep()).held, 0, "queued once: the sync moved past the meeting's end");
+  assert.equal(task().comments.length, 1, "and closed once");
+  clock = at;
+  void b;
+  ok("held: a host's booking task closes an hour after the meeting ends, once, with both fields and a note");
+}
+{
+  const at = clock;
+  const cases = [
+    ["a person moved it", t => { t.status = "in-progress"; }],
+    ["a person commented", t => { (t.comments ||= []).push({ id: "x", content: "Neal: keep this open, they want a second call" }); }],
+    ["it is already closed", t => { t.status = "done"; t.completed = true; }],
+  ];
+  for (const [why, touch] of cases) {
+    const h = harness();
+    await h.book(demo());
+    const [row] = await h.store.listConfirmedBetween(HOST, TUE_0900, TUE_1400);
+    await h.core._syncNoan(row.id);
+    const t = h.noan.db.tasks.get((await h.store.get(row.id)).noan_task_id);
+    touch(t);
+    const before = structuredClone(t);
+    clock = Date.parse(row.end_at) + HELD_GRACE_MS + 60_000;
+    await h.core.sweep();
+    assert.deepEqual(h.noan.db.tasks.get(t.id), before, `left alone when ${why}`);
+    assert.deepEqual((await h.store.get(row.id)).noan_queue, [], `and the item still leaves the queue (${why})`);
+    clock = at;
+  }
+  // An agent's route: `task owner verity` / `task tag X` hand the task to an agent that closes it itself.
+  const h = harness();
+  await h.book(demo({ slug: "quick", startISO: TUE_1400 }));
+  const [row] = await h.store.listConfirmedBetween(HOST, TUE_1400, "2026-09-23T00:00:00Z");
+  await h.core._syncNoan(row.id);
+  const t = h.noan.db.tasks.get((await h.store.get(row.id)).noan_task_id);
+  clock = Date.parse(row.end_at) + HELD_GRACE_MS + 60_000;
+  await h.core.sweep();
+  assert.equal(h.noan.db.tasks.get(t.id).status, "backlog", "an agent-routed task is the agent's to close");
+  clock = at;
+  // A cancelled booking is never queued: its task already went the cancel route.
+  const h2 = harness();
+  const c = await h2.book(demo());
+  const [crow] = await h2.store.listConfirmedBetween(HOST, TUE_0900, TUE_1400);
+  await h2.core._syncNoan(crow.id);
+  await h2.core.cancel(tokenOf(c.data.manageUrl));
+  await h2.core._syncNoan(crow.id);
+  clock = Date.parse(crow.end_at) + HELD_GRACE_MS + 60_000;
+  assert.equal((await h2.core.sweep()).held, 0, "a cancelled booking is not a held meeting");
+  clock = at;
+  ok("held: left open when a person moved or commented on it, when an agent owns it, or when it is closed; cancelled bookings are never queued");
+}
+
+/* ================= a slow attempt is waited for, not raced ================= */
+{
+  // Live 2026-09-24..29: five bookings with two open tasks each. The first book item ran past
+  // its deadline (attempts 1), kept running, and filed its task AFTER the sweeper's retry had
+  // searched the board and found nothing. Booking rows confirmed it: attempts 1, synced ~3.5
+  // minutes after creation. The retry now waits for the abandoned attempt first.
+  const noan = fakeNoan();
+  const real = createNoanCrm({ api: noan.api, verityId: VERITY, timeZone: avail.timeZone });
+  let first = true;
+  const h = harness({
+    deadlines: { noanItemMs: 60, calendarMs: 60 },
+    crmOverride: { apply: async (row, type, item, remember) => {
+      if (item.kind === "book" && first) { first = false; await new Promise(r => setTimeout(r, 100)); }
+      return real.apply(row, type, item, remember);
+    } },
+  });
+  assert.equal((await h.book(demo())).status, 201);
+  await new Promise(r => setTimeout(r, 70));              // the deadline has fired; the attempt is still running
+  const [row] = await h.store.listConfirmedBetween(HOST, TUE_0900, TUE_1400);
+  assert.equal((await h.store.get(row.id)).attempts, 1, "the slow attempt was recorded as a failure");
+  await h.core.sweep();                                   // the retry, while the first is mid-flight
+  await new Promise(r => setTimeout(r, 80));              // and let the abandoned attempt land
+  const tasks = [...noan.db.tasks.values()].filter(t => t.externalId === `booking:${row.id}`);
+  assert.equal(tasks.length, 1, "one task, not two");
+  assert.equal((await h.store.get(row.id)).noan_task_id, tasks[0].id);
+  assert.deepEqual((await h.store.get(row.id)).noan_queue, []);
+  ok("a retry waits for a still-running attempt instead of racing it into a second task");
+}
+
 /* ================= "brief me before the call" ================= */
 {
   const h = harness({ briefEnabled: true });
@@ -630,6 +740,43 @@ blocked dates: christmas
   await crm.apply(other, type, { kind: "book" });
   assert.equal(noan.db.contacts.size, 2, "a SETTLED miss still creates on the first attempt: new guests are not delayed");
   ok("an unsettled contact lookup retries instead of creating, until a late attempt");
+}
+
+/* ========= a guest who is probably a subscriber on another address is flagged ========= */
+{
+  // Same full name as a Free/Subscriber contact, a different address: the booking still files its
+  // own contact (its invite and any reply go to the address the guest gave), and the duplicate is
+  // flagged where a person will see it. Never refused, never merged automatically.
+  const noan = fakeNoan();
+  noan.db.contacts.set("csub", { id: "csub", name: "Jane Doe", email: "jane@doeworks.example", tags: [{ id: "t-s", name: "Subscriber" }], memos: [] });
+  noan.db.contacts.set("clead", { id: "clead", name: "Bo Lind", email: "bo@lind.example", tags: [{ id: "t-l", name: "Lead" }], memos: [] });
+  const crm = createNoanCrm({ api: noan.api, verityId: VERITY, timeZone: avail.timeZone });
+  const type = TYPES.types[0];
+  const row = { id: "bd1", guest_email: "jane.doe@mail.example", guest_name: "Jane  DOE", start_at: "2026-09-16T16:30:00Z",
+                end_at: "2026-09-16T17:00:00Z", answers: [], attempts: 0, host_email: HOST };
+  const remembered = {};
+  await crm.apply(row, type, { kind: "book" }, async (x) => Object.assign(remembered, x));
+  const guest = [...noan.db.contacts.values()].find(c => c.email === "jane.doe@mail.example");
+  assert(guest, "the booking still files the guest's own contact");
+  const task = [...noan.db.tasks.values()][0];
+  assert.match(task.details, /Possible duplicate: Jane Doe is already a contact on another address \(jane@doeworks\.example, Subscriber\)/);
+  assert(noan.db.memos.some(m => m.id === guest.id && /Possible duplicate/.test(m.content)), "the guest's contact carries the flag");
+  assert(noan.db.memos.some(m => m.id === "csub" && /Possible second address/.test(m.content) && m.content.includes("jane.doe@mail.example")), "and so does the subscriber's");
+  ok("a guest whose name matches a subscriber on another address is booked, and flagged on the task and both contacts");
+
+  const memos = noan.db.memos.length;
+  await crm.apply({ ...row, noan_contact_id: guest.id, noan_task_id: task.id }, type, { kind: "book" }, async () => {});
+  assert.equal(noan.db.memos.length, memos, "a retry of the same booking adds no second flag");
+  await crm.apply({ ...row, id: "bd2", guest_email: "bo@other.example", guest_name: "Bo Lind" }, type, { kind: "book" }, async () => {});
+  assert(![...noan.db.tasks.values()].some(t => /Bo Lind/.test(t.details) && /Possible duplicate/.test(t.details)), "a namesake of a lead is not flagged");
+  ok("the flag is once per booking, and only for a Free/Subscriber match");
+
+  const broken = fakeNoan();
+  broken.api.noanGetAll = async () => { throw new Error("list endpoint down"); };
+  const crm2 = createNoanCrm({ api: broken.api, verityId: VERITY, timeZone: avail.timeZone, log: () => {} });
+  await crm2.apply({ ...row, id: "bd3" }, type, { kind: "book" }, async () => {});
+  assert.equal(broken.db.tasks.size, 1, "a failed duplicate check never holds up the booking");
+  ok("the duplicate check is fail-soft");
 }
 
 console.log("\nbooking core: all passed");

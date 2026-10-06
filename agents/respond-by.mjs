@@ -43,7 +43,7 @@ export const RESPOND_BY = {
   get email() { return `Reply to this email and ${agentName()} picks it up as a task — your words first, this message quoted underneath as context.`; },
   get report() { return `Reply to this email naming items ("do A1", or "go ahead" for every [Specific] item) and ${agentName()} picks it up as a task.`; },
   get comment() { return `Comment on the task to steer ${pronouns().obj}: "@${agentName()} <what changed>", or the word the task names ("send", "retry") where it offers one.`; },
-  get reassign() { return `Re-assign ${agentName()} on the task once you have fixed what it names — that is the hand-back, and ${pronouns().subj} picks it up on ${pronouns().poss} next poll.`; },
+  get reassign() { return `Re-assign ${agentName()} on the task once you have fixed what it names — that is the hand-back, and ${pronouns().subj} ${pronouns().verb("pick")} it up on ${pronouns().poss} next poll.`; },
   get human() { return `Nothing comes back to ${agentName()} on this one — a person owns it end to end.`; },
   get reportEmail() { return `Reply to the report email this task points at and ${agentName()} picks it up as a task; name items ("do A1") where the report numbers them.`; },
 };
@@ -57,8 +57,8 @@ export const LANE_RESPONSE = {
    * what it names", which is the wrong sentence on a task whose whole content
    * is a draft waiting for a yes. */
   /* Same getter arrangement as RESPOND_BY: name and pronouns at access time. */
-  get "approval"() { return `Re-assign ${agentName()} on this task and ${pronouns().subj} acts on the draft above as it stands — that is the approval. Leave it unassigned to hold it, or close it to drop it.`; },
-  get "pr-review"() { return `Nothing comes back to ${agentName()} here — this verdict is a PR review. Push a fix and ${pronouns().subj} reviews again on the next push; apply the override-review-gate label if a human is taking the call.`; },
+  get "approval"() { return `Re-assign ${agentName()} on this task and ${pronouns().subj} ${pronouns().verb("act")} on the draft above as it stands — that is the approval. Leave it unassigned to hold it, or close it to drop it.`; },
+  get "pr-review"() { return `Nothing comes back to ${agentName()} here — this verdict is a PR review. Push a fix and ${pronouns().subj} ${pronouns().verb("review")} again on the next push; apply the override-review-gate label if a human is taking the call.`; },
   get "course"() { return `Fix what this task names, then start the course again by telling ${agentName()} (or the customer) RESUME — that is the hand-back, not a re-assign.`; },
   get "ci-alert"() { return `Nothing comes back to ${agentName()} — fix what this task names and close it yourself. A repeat failure appends a run line here rather than filing a second task.`; },
 };

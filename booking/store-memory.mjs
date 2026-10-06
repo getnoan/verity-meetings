@@ -69,6 +69,14 @@ export function createMemoryStore({ now = () => new Date() } = {}) {
         r.guest_email === guestEmail && r.start_at > nowISO).length;
     },
 
+    /** Confirmed rows with a task whose meeting ended in [fromISO, toISO), oldest first. */
+    async listEnded(fromISO, toISO, limit = 50) {
+      return [...rows.values()]
+        .filter(r => r.status === "confirmed" && r.noan_task_id && r.end_at >= fromISO && r.end_at < toISO)
+        .sort((a, b) => (a.end_at < b.end_at ? -1 : 1))
+        .slice(0, limit).map(copy);
+    },
+
     /** Rows with calendar or NOAN work still owed, oldest first. */
     async listPending(limit = 25) {
       return [...rows.values()]

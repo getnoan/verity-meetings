@@ -34,6 +34,7 @@ export const TRIGGER_TAG_REGISTRY = [
   { tag: "support",    worker: "reply-worker.mjs (scanSupportTasks)", customerFacing: false },
   { tag: "Social",     worker: "social-worker.mjs",                   customerFacing: false },
   { tag: "LinkedIn",   worker: "linkedin-worker.mjs",                 customerFacing: false },
+  { tag: "Marketing",  worker: "marketing-worker.mjs",                customerFacing: false, gate: "MARKETING_ENABLED" },
   { tag: "Deck",       worker: "design/deck.py + sdr-deck-worker.mjs", customerFacing: true },
   { tag: "Ad Asset",   worker: "design/design.py",                    customerFacing: false },
   { tag: "Demo Video", worker: "demo-worker.mjs",                     customerFacing: true },

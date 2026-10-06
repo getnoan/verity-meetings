@@ -9,6 +9,8 @@
  *   cancel      memo, then the type's `on cancel:` route (close, keep, hand to a trigger tag)
  *   brief       the guest ticked "brief me before the call": a task for the Pre-call Brief
  *               agent, then a dispatch so it runs now, not at the next poll
+ *   held        the meeting has ended (the sweeper queues this): close the host's task, unless
+ *               an agent owns it, a person has moved it or commented, or it is already closed
  *
  * Every item is safe to run twice. Memos carry a title and are skipped when a
  * memo with that title is already on the contact; the task id is remembered on
@@ -21,6 +23,8 @@ import * as live from "../agents/noan.mjs";
 import { QUESTION_KINDS } from "../agents/booking-types.mjs";
 import { respondLine } from "../agents/respond-by.mjs";
 import { agentIdentityId } from "../agents/required-env.mjs";
+import { hasAgentMarker } from "../agents/agent-comment.mjs";
+import { nameMatchUserContact } from "../agents/sender-registration.mjs";
 
 const UNTRUSTED = "Guest answers (written by the guest, unverified):";
 const DETAILS_MAX = 2000;
@@ -51,6 +55,12 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
   const short = iso => { const p = parts(iso); return `${p.dow} ${p.d} ${p.mon} ${p.hm}`; };
 
   const typeName = (type, row) => type?.name || row.type_slug;
+  // The host owns the meeting; when an agent is routed in (`task owner verity`, `task tag X`), it
+  // works the task itself and closes it itself.
+  const hostOwned = type => {
+    const route = type?.onBook || { kind: "owner", who: "host" };
+    return route.kind === "owner" && (route.who || "host") === "host";
+  };
   const pageUrl = (type) => (type && publicUrl ? `${publicUrl.replace(/\/$/, "")}/${type.handle}/${type.slug}` : "");
 
   function answerLines(row) {
@@ -76,16 +86,18 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
     return api.sanitizeCopy(`${typeName(type, row)}: ${row.guest_name} · ${short(row.start_at)}`).slice(0, 200);
   }
 
-  function taskDetails(type, row, contactId) {
+  const tagNames = c => (c.tags || []).map(t => t.name).filter(Boolean).join(", ") || "no tags";
+
+  function taskDetails(type, row, contactId, twin = null) {
     const head = [
       `${typeName(type, row)} with ${row.guest_name} (${row.guest_email})`,
       `When: ${when(row.start_at, row.end_at)}`,
       row.meeting_url ? `Meet: ${row.meeting_url}` : null,
       `Booked through NOAN Meetings${pageUrl(type) ? ` (${pageUrl(type)})` : ""}.`,
+      // In the head, which the trim below never cuts: it is the line the host must not miss.
+      twin ? `Possible duplicate: ${twin.name} is already a contact on another address (${twin.email}, ${tagNames(twin)}). If this is the same person, merge the two contacts in NOAN, or the account counts twice.` : null,
     ].filter(Boolean);
-    // The host owns the meeting; when an agent is routed in, it works the task itself.
-    const hostOwned = (type?.onBook || { kind: "owner", who: "host" }).kind === "owner" && (type?.onBook?.who || "host") === "host";
-    const tail = [...(hostOwned ? [respondLine("human")] : []), `Contact ID: ${contactId}`, `Source: booking:${row.id}`];
+    const tail = [...(hostOwned(type) ? [respondLine("human")] : []), `Contact ID: ${contactId}`, `Source: booking:${row.id}`];
     let answers = answerLines(row);
     let text = [...head, "", ...answers, "", ...tail].join("\n");
     // The API rejects details over 2048: trim the guest's answers, never the routing lines.
@@ -96,7 +108,22 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
     return api.sanitizeCopy(text).slice(0, DETAILS_MAX);
   }
 
-  async function createTask(type, row, contactId, remember) {
+  /** A Free/Subscriber contact with the guest's full name on ANOTHER address, or null: probably
+   *  the same person booking from a second address. Flagged, never refused or merged: the
+   *  booking's own address is the one its invite and any reply go to. Fail-soft, because a
+   *  booking must never wait on a check that exists only to tidy the contact list. */
+  async function possibleTwin(row, contactId) {
+    try {
+      const all = await api.noanGetAll("/contacts?per_page=100");
+      const twin = nameMatchUserContact(all, row.guest_email, row.guest_name);
+      return twin && twin.id !== contactId ? twin : null;
+    } catch (e) {
+      log(`booking ${row.id}: duplicate check skipped (${e.message})`);
+      return null;
+    }
+  }
+
+  async function createTask(type, row, contactId, remember, twin = null) {
     const route = type?.onBook || { kind: "owner", who: "host" };
     // The row's noan_task_id is the primary guard and it is enough on the happy
     // path. It is NOT enough after a timeout: withDeadline in core.mjs is a
@@ -124,7 +151,7 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
       }
     }
     const created = await api.noanPost("/tasks", {
-      title: taskTitle(type, row), details: taskDetails(type, row, contactId),
+      title: taskTitle(type, row), details: taskDetails(type, row, contactId, twin),
       status: "backlog", dueDate: row.start_at, externalId,
     });
     const taskId = created?.task?.id || created?.id;
@@ -190,8 +217,22 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
       row.meeting_url ? `Meet: ${row.meeting_url}` : null,
       ...answerLines(row),
     ].filter(Boolean));
+    // Once per booking (its task not yet filed), on new and existing guest contacts alike: a
+    // duplicate already on file is still a duplicate until someone merges it.
+    const twin = row.noan_task_id ? null : await possibleTwin(row, contactId);
+    if (twin) {
+      log(`booking ${row.id}: guest ${contactId} may duplicate ${twin.id} (same name, another address)`);
+      await memoOnce(contactId, c, `booking:${row.id}:possible-duplicate`, [
+        `[NOAN Meetings] Possible duplicate: this guest's name matches another contact, ${twin.name} (${twin.email}, ${tagNames(twin)}).`,
+        `If it is the same person, merge the two contacts in NOAN so the account is counted once.`,
+      ]);
+      await memoOnce(twin.id, await contactDetail(twin.id), `booking:${row.id}:possible-duplicate`, [
+        `[NOAN Meetings] Possible second address: ${row.guest_name} booked ${typeName(type, row)} as ${row.guest_email}, which has its own contact (${contactId}).`,
+        `If it is the same person, merge the two contacts in NOAN so the account is counted once.`,
+      ]);
+    }
     if (!row.noan_task_id && (type?.onBook?.kind || "owner") !== "none") {
-      await createTask(type, row, contactId, remember);
+      await createTask(type, row, contactId, remember, twin);
     }
     return {};
   }
@@ -273,12 +314,44 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
     return {};
   }
 
+  /* The open board, read once a minute at most. On deploy the sweeper queues every meeting that
+   * ended in the lookback at once, and a board scan per booking would spend the API's rate
+   * limit (200 requests a minute; a drift check hit it on 2026-10-02). */
+  let openBoard = null;
+  async function openTask(id) {
+    if (!openBoard || Date.now() - openBoard.at > 60_000) {
+      const rows = await api.noanGetAll("/tasks?completed=false&per_page=100");
+      openBoard = { at: Date.now(), byId: new Map(rows.map(t => [t.id, t])) };
+    }
+    return openBoard.byId.get(id) || null;
+  }
+
+  /** The meeting has happened: the booking task has done its job of handing the call to the host.
+   *  Follow-ups from the call live on their own tasks (the Granola sync files them). Before this,
+   *  nothing closed a held meeting's task, and twelve sat open on 2026-10-02. */
+  async function held(row, type) {
+    if (row.status !== "confirmed" || !row.noan_task_id) return {};
+    if (!hostOwned(type)) { log(`booking ${row.id}: held; task ${row.noan_task_id} belongs to an agent's route, left for it`); return {}; }
+    const task = await openTask(row.noan_task_id);
+    // Not on the open board: closed already (by hand, or a cancel), or missed by a lossy read.
+    // Either way there is nothing safe to do, and noan_synced_at moving on means no retry loop.
+    if (!task || task.completed || task.status === "done") return {};
+    if (task.status !== "backlog") { log(`booking ${row.id}: held; task ${task.id} is ${task.status || "in no column"}, so a person moved it: left open`); return {}; }
+    if ((task.comments || []).some(c => !hasAgentMarker(c.content))) { log(`booking ${row.id}: held; a person commented on task ${task.id}: left open`); return {}; }
+    await api.noanPatch(`/tasks/${task.id}`, { status: "done", completed: true });
+    openBoard?.byId.delete(task.id);
+    await api.postTaskComment(task.id, `This meeting has taken place (${when(row.start_at, row.end_at)}), so the booking task is closed. Anything the call produced belongs on its own follow-up task.`)
+      .catch(e => log(`booking ${row.id}: task ${task.id} closed, but the note failed: ${e.message}`));
+    return {};
+  }
+
   return {
     async apply(row, type, item, remember = async () => {}) {
       if (item.kind === "brief") return brief(row, type, item);
       if (item.kind === "book") return book(row, type, remember);
       if (item.kind === "reschedule") return reschedule(row, type, item);
       if (item.kind === "cancel") return cancel(row, type, item);
+      if (item.kind === "held") return held(row, type);
       log(`booking ${row.id}: unknown queue item ${JSON.stringify(item).slice(0, 80)} dropped`);
       return {};
     },

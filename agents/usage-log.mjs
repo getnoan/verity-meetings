@@ -26,12 +26,23 @@ import path from "node:path";
 const TIMEOUT_MS = 10_000;
 
 /* Per-MTok USD for Anthropic; per-unit USD for the rest (unit = char for
- * elevenlabs, scrape/search for firecrawl, recipient for resend). Cache read
- * bills at 0.1× input, cache write at 1.25× input. */
+ * elevenlabs, scrape/search for firecrawl, recipient for resend). Cache write
+ * bills at 1.25× input; cache read at 0.1× input unless the model sets its own
+ * `cacheRead` rate (the newer models price reads below that ratio).
+ *
+ * A model missing here prices at $0 in the ledger AND in the spend report's
+ * per-key table, so it hides instead of erroring: add a model the day anything
+ * might call it, not the day it shows up on the bill. */
 export const PRICING = {
   anthropic: {
+    "claude-fable-5-1":  { in: 10, out: 50, cacheRead: 0.25 },
+    "claude-fable-5":    { in: 10, out: 50 },
+    "claude-opus-5-5":   { in: 4, out: 20, cacheRead: 0.2 },
     "claude-opus-5":     { in: 5, out: 25 },
     "claude-opus-4-8":   { in: 5, out: 25 },
+    "claude-opus-4-7":   { in: 5, out: 25 },
+    "claude-opus-4-6":   { in: 5, out: 25 },
+    "claude-sonnet-5-5": { in: 2, out: 10, cacheRead: 0.2 },
     "claude-sonnet-5":   { in: 2, out: 10 },
     "claude-sonnet-4-6": { in: 3, out: 15 },
     "claude-haiku-4-5":  { in: 1, out: 5 },
@@ -69,6 +80,11 @@ export function anthropicRate(model) {
   return table[model] || table[String(model || "").replace(/-\d{8}$/, "")];
 }
 
+/** Per-MTok cache-read rate for an anthropicRate() entry. */
+export function cacheReadRate(rate) {
+  return rate.cacheRead ?? rate.in * 0.1;
+}
+
 /** Estimated USD for one call. Unknown provider/model → 0 (row still logged;
  *  spend-worker flags unpriced rows). */
 export function estimateCost({ provider, model, usage, units }) {
@@ -81,7 +97,7 @@ export function estimateCost({ provider, model, usage, units }) {
     const outTok = usage.output_tokens || 0;
     const cacheRead = usage.cache_read_input_tokens || 0;
     const cacheWrite = usage.cache_creation_input_tokens || 0;
-    return (rate.in * inTok + rate.out * outTok + rate.in * 0.1 * cacheRead + rate.in * 1.25 * cacheWrite) / 1e6;
+    return (rate.in * inTok + rate.out * outTok + cacheReadRate(rate) * cacheRead + rate.in * 1.25 * cacheWrite) / 1e6;
   }
   return (p.perUnit || 0) * (Number(units) || 0);
 }

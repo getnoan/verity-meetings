@@ -16,7 +16,8 @@
  * store refuses an overlap) → reconcile the calendar inline so the guest sees
  * the Meet link → answer → NOAN work queued on the row and run after the reply.
  * Anything a request could not finish, the sweeper finishes; five failures
- * park it for a human.
+ * park it for a human. The sweeper also queues a `held` item an hour after each
+ * meeting ends, which closes the host's booking task (noan-sync.mjs).
  *
  * Guest-typed text never chooses a route. Which tags and which agent a
  * booking reaches come only from its type in the Booking Types fact.
@@ -52,6 +53,10 @@ const PARKED_RETRY_MS = 6 * 3600_000;
 // contact when the name search misses (~50s at ~800 contacts).
 const NOAN_ITEM_DEADLINE_MS = 150_000;
 const CALENDAR_DEADLINE_MS = 60_000;
+/** A held meeting's task closes this long after the meeting ends, and only for meetings that
+ *  ended within the lookback (so a deploy doesn't walk the whole history). */
+export const HELD_GRACE_MS = 60 * 60_000;
+export const HELD_LOOKBACK_MS = 14 * 86400_000;
 
 function withDeadline(promise, ms, what) {
   let timer;
@@ -83,6 +88,14 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
     return run;
   }
   const base = String(publicUrl || "").replace(/\/$/, "");
+  // The crm.apply a deadline gave up on, per booking, while it is still running. withDeadline
+  // is a Promise.race: losing the race abandons the WAIT, not the work. Between 2026-09-24 and
+  // 09-29 five bookings got two open tasks each this way: the first book item ran past the
+  // deadline (attempts went to 1), kept going, and filed its task after the sweeper's retry had
+  // already searched the board and found nothing. The board search cannot close that window;
+  // waiting for the earlier attempt can, and one process (see locks) is what makes this map
+  // the whole truth.
+  const inflight = new Map();
 
   /**
    * The zone a type's `hours` lines are read in, most specific first:
@@ -211,6 +224,14 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
   async function syncNoan(id) {
     for (;;) {
       const done = await withLock(id, async () => {
+        // An earlier attempt still running gets one more deadline to finish before this one
+        // starts. Bounded, so an attempt that never answers can't block the booking for good:
+        // past it, the retry goes ahead on the row and the board lookup as before.
+        const prior = inflight.get(id);
+        if (prior) {
+          await withDeadline(prior.catch(() => {}), noanItemMs, "an earlier NOAN attempt")
+            .catch(() => log(`booking ${id}: an earlier NOAN attempt is still running; retrying anyway`));
+        }
         const cur = await store.get(id);
         if (!cur?.noan_queue?.length) return true;
         const { type } = await typeForRow(cur);
@@ -218,7 +239,11 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
         // remember() stores an id (contact, task) the moment it exists, so a later
         // failure in the same item can't make the retry create it a second time.
         const remember = p => store.update(id, p);
-        const patch = await withDeadline(crm.apply(cur, type, item, remember), noanItemMs, `NOAN ${item.kind}`);
+        const work = crm.apply(cur, type, item, remember);
+        inflight.set(id, work);
+        const clear = () => { if (inflight.get(id) === work) inflight.delete(id); };
+        work.then(clear, clear);
+        const patch = await withDeadline(work, noanItemMs, `NOAN ${item.kind}`);
         await store.update(id, { ...(patch || {}), noan_queue: rest, noan_synced_at: now().toISOString(), last_error: null });
         return false;
       });
@@ -243,6 +268,27 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
       await onStuck(next, message).catch(e => log(`booking ${row.id}: stuck handler failed: ${e.message}`));
     }
     return next;
+  }
+
+  /** Queue a `held` item on every booking whose meeting ended (past the grace) and whose NOAN
+   *  side has not been touched since: noan_synced_at before end_at. Once the item runs,
+   *  noan_synced_at moves past end_at, so each booking is queued once. No schema change. */
+  async function queueHeld() {
+    if (!store.listEnded) return 0;
+    const t = now().getTime();
+    const settledBeforeEnd = r => !r.noan_synced_at || Date.parse(r.noan_synced_at) < Date.parse(r.end_at);
+    const due = r => r.status === "confirmed" && r.noan_task_id && !(r.noan_queue || []).length && settledBeforeEnd(r);
+    const rows = await store.listEnded(new Date(t - HELD_LOOKBACK_MS).toISOString(), new Date(t - HELD_GRACE_MS).toISOString());
+    let queued = 0;
+    for (const r of rows.filter(due)) {
+      const ok = await withLock(r.id, async () => {
+        const cur = await store.get(r.id);
+        if (!cur || !due(cur)) return false;
+        return !!(await store.update(r.id, { noan_queue: [{ kind: "held" }] }, { expectStatus: "confirmed" }));
+      });
+      if (ok) queued++;
+    }
+    return queued;
   }
 
   function runNoanLater(id) {
@@ -402,6 +448,9 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
 
     /** Finish what requests could not: calendar reconcile, then the NOAN queue. */
     async sweep({ limit = 25 } = {}) {
+      // Held meetings first, so their close runs in this same pass. A failed read here must not
+      // cost the rest of the sweep.
+      const held = await queueHeld().catch(e => { log(`booking: held-meeting check failed: ${e.message}`); return 0; });
       const rows = await store.listPending(limit);
       let done = 0, failed = 0;
       for (const row of rows) {
@@ -423,7 +472,7 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
           await noteFailure(await store.get(row.id), e.message);
         }
       }
-      return { checked: rows.length, done, failed };
+      return { checked: rows.length, done, failed, held };
     },
 
     /** Test seam: wait for NOAN work kicked off after a reply. */

@@ -165,6 +165,9 @@ export async function sendBatch(emails, { idempotencyKey, permissive = true } = 
     if (REPLY_TO) m.reply_to = REPLY_TO;
     if (e.headers) m.headers = e.headers;
     if (e.tags?.length) m.tags = e.tags;
+    // ISO 8601. Resend holds the message and delivers it then; a scheduled email
+    // can be cancelled until it goes (cancelEmail below).
+    if (e.scheduledAt) m.scheduled_at = e.scheduledAt;
     return m;
   });
   const res = await fetch(`${RESEND_URL}/batch`, { method: "POST", headers, body: JSON.stringify(body) });
@@ -182,6 +185,24 @@ export async function sendBatch(emails, { idempotencyKey, permissive = true } = 
   appendSendLogMany(sent.filter(e => e.id));
   await recordUsage({ provider: "resend", units: sent.reduce((n, e) => n + e.to.length, 0) });
   return results;
+}
+
+/** Cancel one SCHEDULED email before it is delivered (POST /emails/{id}/cancel).
+ *  Returns { ok, status, error }. Never throws: the caller is sweeping a list
+ *  and must record which ones it could not stop. An email that has already
+ *  gone (or was never scheduled) comes back as an error, which is the truth. */
+export async function cancelEmail(id) {
+  if (!id) return { ok: false, status: 0, error: "no Resend id" };
+  const { key: KEY } = mailEnv({ needFrom: false });
+  try {
+    const res = await fetch(`${RESEND_URL}/${encodeURIComponent(id)}/cancel`, { method: "POST", headers: { Authorization: `Bearer ${KEY}` } });
+    if (res.ok) return { ok: true, status: res.status, error: null };
+    const raw = await res.text();
+    let msg = raw; try { const j = JSON.parse(raw); msg = j?.message || j?.error?.message || raw; } catch { /* raw it is */ }
+    return { ok: false, status: res.status, error: String(msg).slice(0, 200) };
+  } catch (e) {
+    return { ok: false, status: 0, error: e.message };
+  }
 }
 
 /* ---------------- periodic report sends (added 2026-08-13) ----------------

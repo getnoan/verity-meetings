@@ -84,7 +84,10 @@ function assertNoDowngrade() {
  *  agent's, and the run then refuses to start on anything else.
  *
  *  One GET /me per key per process, memoised INCLUDING a failure, so an outage
- *  costs one request rather than one per call. Fails closed: an unreachable
+ *  costs one retry ladder rather than one per call. A 429, 5xx or network
+ *  error retries on call()'s 2+4+8+15s ladder (Retry-After honoured, same
+ *  15s cap) before failing, so a single rate-limited /me cannot fail a run
+ *  that every later call would have retried through. Fails closed: an unreachable
  *  /me is not a reason to write under an unconfirmed identity. It uses fetch
  *  directly because call() is what it guards. A revoked key answers 403
  *  "Invalid API Key", not 401, so both mean a bad key. */
@@ -92,9 +95,22 @@ const _expectBot = new Map();
 function expectBot(key) {
   if (!_expectBot.has(key)) {
     _expectBot.set(key, (async () => {
+      const retries = 4;
       let res;
-      try { res = await fetch(`${BASE}/me`, { headers: { Authorization: `Bearer ${key}` } }); }
-      catch (e) { throw tag(new Error(`NOAN_EXPECT_BOT=1 but GET /me could not be reached (${e.message}); refusing to run under an unconfirmed identity`), null); }
+      for (let attempt = 0; ; attempt++) {
+        try { res = await fetch(`${BASE}/me`, { headers: { Authorization: `Bearer ${key}` } }); }
+        catch (e) {
+          if (attempt >= retries) throw tag(new Error(`NOAN_EXPECT_BOT=1 but GET /me could not be reached (${e.message}); refusing to run under an unconfirmed identity`), null);
+          await new Promise(r => setTimeout(r, Math.min(2000 * 2 ** attempt, 15000)));
+          continue;
+        }
+        if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+          const after = Number(res.headers?.get?.("retry-after"));
+          await new Promise(r => setTimeout(r, after > 0 ? Math.min(after * 1000, 15000) : Math.min(2000 * 2 ** attempt, 15000)));
+          continue;
+        }
+        break;
+      }
       let me = null; try { me = JSON.parse(await res.text()); } catch { /* reported below */ }
       if (res.status === 401 || res.status === 403) {
         throw tag(new Error(`NOAN_EXPECT_BOT=1 but the key was rejected (${res.status} ${me?.message || ""}); it is revoked, mistyped or not a NOAN key`), res.status, me);

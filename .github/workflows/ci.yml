@@ -1,5 +1,11 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 # Read-only, stated rather than inherited: nothing here writes to the repo, and a repository
 # whose default token was ever widened would otherwise hand that to every job.
 permissions:

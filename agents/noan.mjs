@@ -4,22 +4,24 @@
  *
  * Contracts confirmed against the OpenAPI spec:
  *   GET   /me
- *   GET   /facts?block_slug=<slug>        → { meta, links, items:[{id,blockSlug,content,createdAt}] }
- *   GET   /contacts?q=<query>             → { ..., items:[Contact] }  ← matches NAME only,
- *                                            never email; for an address use findContactByEmail()
+ *   GET   /facts?block_id=<id>            → { meta, links, items:[{id,blockId,blockSlug,content,createdAt}] }
+ *         (`block_slug=` is deprecated; call() sends a slug as its id, see block-id.mjs)
+ *   GET   /contacts?q=<query>             → { ..., items:[Contact] }  ← matches name, alias and
+ *                                            website, never email: for an address use findContactByEmail()
  *   GET   /blocks ?slug/title             → { ..., items:[BlockListItem] }
  *   GET   /tasks ?status&completed        → { ..., items:[Task] }
  *   POST  /tasks                          → create
  *   PATCH /tasks/{id}  {status,completed,details,title}   ← partial update (confirmed)
- *   (no GET /tasks/{id}, no POST /tasks/{id}/notes — both 404; a "note on the
- *    task" is appendTaskDetails()/appendTaskNote() below, into `details`)
+ *   (no GET /tasks/{id}, no POST /tasks/{id}/notes: both 404. A status note is a
+ *    comment via postTaskComment(); appendTaskDetails()/appendTaskNote() write `details`)
  *   PUT   /tasks/{id}/tags  {tagIds[]}    ← REPLACES the set
  *   POST  /notes  {content,title?,externalId?}   ← content caps at 25,000 chars; post via postNote()
- *   POST  /facts  {blockSlug,content}
+ *   POST  /facts  {blockId,content}       ← `blockSlug` deprecated, sent as blockId by call()
  *   GET   /tags                           → { ..., items:[Tag] }
  */
 import { agentIdentityIds, agentIdentityId, agentName as defaultAgentName } from "./required-env.mjs";
 import { buildAgentComment, commentSecret, markerOverhead, hasAgentMarker } from "./agent-comment.mjs";
+import { createBlockIdResolver, toBlockIdRequest } from "./block-id.mjs";
 
 const BASE = process.env.NOAN_API_URL
   ? `${process.env.NOAN_API_URL.replace(/\/$/, "")}/v1`
@@ -36,11 +38,7 @@ export function noanKey() {
 /** Refuse to run without a key, loudly.
  *
  *  A workflow whose secret is missing or misspelled renders `${{ secrets.X }}` as an EMPTY
- *  STRING, not an error. Before the per-category split that fell through to the shared key and
- *  the run went green under the wrong identity — and after it, a missing NOAN_KEY_* would have
- *  fallen back to a broad personal key with none of the category's scope or stack limits, with
- *  nothing in the log to say so. Every boundary was one absent secret away from being bypassed
- *  silently. Hence: no key, no run. */
+ *  STRING, not an error, so no key means no run. */
 export function assertNoanKey() {
   if (!noanKey()) {
     throw new Error(
@@ -52,17 +50,11 @@ export function assertNoanKey() {
 
 /** Refuse to silently fall back from a per-category key to the shared one.
  *
- *  This is the hole the per-category split left open. A workflow sets
- *  NOAN_AGENT_API_KEY: ${{ secrets.NOAN_KEY_DEMAND }}; if that secret is missing, revoked or
- *  misspelled, GitHub renders it as an EMPTY STRING rather than failing. The empty value is
- *  falsy, so the client fell through to NOAN_PERSONAL_API_KEY — a broad personal key with none
- *  of the category's scopes or stack limits — and the run went green with nothing in the log.
- *  Every boundary was one absent secret away from being bypassed, invisibly.
- *
- *  So a workflow that means to use a category key says so with NOAN_REQUIRE_AGENT_KEY=1, and
- *  the fallback becomes an error instead of a downgrade. Steps that deliberately want the
- *  shared key — trial.yml's seed step, which needs a human key for its fact writes — set it
- *  to 0 alongside blanking NOAN_AGENT_API_KEY, so the intent is written down at the call site.
+ *  A missing, revoked or misspelled NOAN_AGENT_API_KEY secret renders as an EMPTY STRING, and
+ *  an empty key would fall through to NOAN_PERSONAL_API_KEY, a broad key with none of the
+ *  category's scopes or stack limits. A workflow that means to use a category key sets
+ *  NOAN_REQUIRE_AGENT_KEY=1 and that fallback becomes an error. A step that deliberately wants
+ *  the shared key (trial.yml's seed step) sets it to 0 and blanks NOAN_AGENT_API_KEY.
  */
 function assertNoDowngrade() {
   if (process.env.NOAN_REQUIRE_AGENT_KEY !== "1") return;
@@ -77,11 +69,9 @@ function assertNoDowngrade() {
 
 /** NOAN_EXPECT_BOT=1: this run's key must belong to the NOAN agent (role bot).
  *
- *  NOAN_REQUIRE_AGENT_KEY only proves a key is PRESENT. Once a workspace's
- *  keys belong to its agent identity, the failure left is a secret re-set with
- *  a person's key: everything works, and every comment and fact is attributed
- *  to that person again, silently. A workflow sets this once its key is the
- *  agent's, and the run then refuses to start on anything else.
+ *  NOAN_REQUIRE_AGENT_KEY only proves a key is PRESENT. A secret re-set with a
+ *  person's key still works, and silently attributes every comment and fact to
+ *  that person. With this set the run refuses to start on anything but the agent's key.
  *
  *  One GET /me per key per process, memoised INCLUDING a failure, so an outage
  *  costs one retry ladder rather than one per call. A 429, 5xx or network
@@ -137,29 +127,25 @@ function headers() {
 }
 
 /* Errors carry e.noan = { status, kind } so surfaces can speak like a person
- * instead of echoing "NOAN GET /facts?… → 401" at the user (2026-08-21,
- * after a key reset): kind "auth" = the key is bad/reset (401/403),
- * "unreachable" = network/5xx exhaustion, "api" = everything else. */
+ * instead of echoing "NOAN GET /facts?… → 401" at the user: kind "auth" = the
+ * key is bad/reset (401/403), "unreachable" = network/5xx exhaustion, "api" =
+ * everything else. */
 function tag(err, status, payload) {
   err.noan = {
     status: status ?? null,
     kind: status === 401 || status === 403 ? "auth" : status == null || status >= 500 || status === 429 ? "unreachable" : "api",
-    // The parsed body, not just its prose. A 4xx can carry the identifier the
-    // caller needs to recover — a 409 from POST /contacts names the contact
-    // that already owns the address — and reading it back out of the message
-    // string with a regex is how that recovery silently stops working the day
-    // the wording changes.
+    // The parsed body, not just its prose: a 4xx can carry the id the caller
+    // needs to recover (a 409 from POST /contacts names the existing contact).
+    // Never regex it out of the message string, which breaks when wording changes.
     code: payload?.code ?? null,
     payload: payload ?? null,
   };
   return err;
 }
 
-/** The request URL for a path, or for an absolute URL — which must be on the API's own origin.
+/** The request URL for a path, or for an absolute URL, which must be on the API's own origin.
  *  Every call carries the NOAN key, so an absolute URL on any other host would hand the key to
- *  whoever controls that host. Nothing in the fleet passes one today (noanGetAll deliberately
- *  never follows links.next), so this refuses what should not happen rather than changing what
- *  does; CodeQL js/request-forgery flagged it where a public chat service calls into here. */
+ *  whoever controls that host. */
 export function noanUrl(path) {
   if (!/^https?:/i.test(path)) return `${BASE}${path}`;
   if (new URL(path).origin !== new URL(BASE).origin) {
@@ -168,18 +154,16 @@ export function noanUrl(path) {
   return path;
 }
 
+// Slug inputs on /facts go out as block ids (agents/block-id.mjs). The lookup is
+// itself a GET through call(), on /blocks, so it never re-enters the rewrite.
+const resolveBlockId = createBlockIdResolver(p => call("GET", p));
+
 async function call(method, path, body, { retries = 4 } = {}) {
+  ({ path, body } = await toBlockIdRequest(method, path, body, resolveBlockId));
   const url = noanUrl(path);
-  // Build the headers ONCE, and OUTSIDE the try below. Still per request, so an
-  // agent that sets NOAN_AGENT_API_KEY before its first call is honoured — but
-  // no longer per ATTEMPT, and no longer inside the catch that retries.
-  //
-  // headers() can throw: a missing key, or a category key that a workflow left
-  // empty (assertNoDowngrade). Both are permanent configuration faults. Inside
-  // the try they were caught as transient network errors and retried through the
-  // full 2+4+8+15s ladder — 29s per call, and connectMenu()'s six probes turned
-  // that into a 174s unit-test run. Same class of mistake as reporting a 403
-  // MissingPermission as a retryable blip: a config error must fail on the spot.
+  // Build the headers once per request and OUTSIDE the retrying try below.
+  // headers() throws on a missing or empty key, a permanent config fault that
+  // must fail on the spot rather than go through the retry ladder.
   const hdrs = headers();
   if (process.env.NOAN_EXPECT_BOT === "1") await expectBot(noanKey());
   for (let attempt = 0; ; attempt++) {
@@ -220,8 +204,7 @@ export const noanPatch = (p, b)     => call("PATCH", p, b);
 export const noanPut   = (p, b)     => call("PUT", p, b);
 
 /** The same path with one query param replaced and, optionally, others dropped
- *  (page/per_page are the two we rewrite). Every OTHER param survives — that is
- *  the whole point, see sweepOnce. The one query-rewriting code path. */
+ *  (page/per_page are the two we rewrite). Every OTHER param must survive, see sweepOnce. */
 const withParam = (path, key, value, { drop = [] } = {}) => {
   const [base, qs = ""] = path.split("?");
   const params = new URLSearchParams(qs);
@@ -233,20 +216,11 @@ const withParam = (path, key, value, { drop = [] } = {}) => {
 /** One pass at a fixed page size. Returns the rows AND the server's own totalItems
  *  so the caller can tell a complete read from a partial one.
  *
- *  NEVER follows `links.next`. The API's next-page link DROPS EVERY QUERY PARAM:
- *  measured 2026-09-11, `GET /tasks?completed=false&per_page=100` reports
- *  meta.totalItems 120 and links.next `…/tasks?page=2&per_page=100` — no
- *  `completed`. Following it, this walked the WHOLE board from page two: 1215
- *  rows, 1095 of them completed, for a 120-item open list. Same on every list
- *  endpoint (/notes, /assets — which also loses its sort/order — /contacts,
- *  /facts). The failure is silent and only appears once the filtered set passes
- *  per_page: `status=backlog` sat at 94 that day, one page short of the general
- *  lane's claim list including tasks from every status.
- *
- *  So each page URL is built from the ORIGINAL path plus page=N, and the walk
- *  stops on meta.hasNext === false; links.next is consulted only when a response
- *  carries no meta at all (none does today — kept as the fallback so an endpoint
- *  that drops meta degrades to the old behaviour, not to a single page). */
+ *  NEVER follow `links.next`: on every list endpoint it DROPS EVERY QUERY PARAM
+ *  (filters, and sort/order on /assets), so following it walks the whole unfiltered
+ *  list from page two once the filtered set passes per_page. Each page URL is the
+ *  ORIGINAL path plus page=N, and the walk stops on meta.hasNext === false.
+ *  links.next is read only when a response carries no meta at all. */
 export function pageUrl(path, page) {
   return page === 1 && !/[?&]page=/.test(path) ? path : withParam(path, "page", page);
 }
@@ -258,29 +232,11 @@ export function hasNextPage(res) {
   return !!res?.links?.next;
 }
 
-/** Retry budget for ONE page of a paginated read. Deliberately larger than call()'s
- *  default of 4 (2+4+8+15s ≈ 29s), which is tuned for a single request — and a sweep
- *  is not a single request. noanGetAll("/contacts") is ~70 of them back to back,
- *  because the union passes at 100/75/50/25 always run in full there (the first pass
- *  never reaches meta.totalItems on that endpoint, which is the whole reason the union
- *  exists). A burst that size can rate-limit itself.
- *
- *  On 2026-09-23 it did. The reply worker's hourly sweep landed inside the Wednesday
- *  weekly-activity-report run — the fleet's other heavy /contacts reader, two full
- *  unions of its own plus tasks/facts/blocks/stacks/notes/assets — and died on
- *  `/contacts?per_page=50&page=4` with `429 after 4 retries`: 29s of backoff was not
- *  enough to outlast the throttle, and the throw took down a worker that had already
- *  established there was no inbound mail to handle.
- *
- *  Note what is NOT the fix: moving the cron. reply-worker fires at :13, and Actions
- *  schedule drift on it measured +6 to +42 min over 20 consecutive runs, so it starts
- *  anywhere in the hour regardless of what the cron says. Collisions cannot be
- *  scheduled away; they have to be survived.
- *
- *  8 gives ~89s (2+4+8+15+15+15+15+15). READS ONLY — writes keep the tight budget on
- *  purpose: a write that cannot land should say so promptly rather than hold a run open
- *  on a retry ladder. The job timeout is the backstop for NOAN being down rather than
- *  merely busy. */
+/** Retry budget for ONE page of a paginated read, larger than call()'s default of 4
+ *  (about 29s). A /contacts sweep is ~70 requests back to back and can rate-limit itself,
+ *  or collide with another heavy reader, and 29s of backoff does not outlast that.
+ *  8 gives about 89s. READS ONLY: a write that cannot land must say so promptly rather
+ *  than hold a run open on a retry ladder. */
 export const SWEEP_RETRIES = 8;
 
 async function sweepOnce(path) {
@@ -305,13 +261,11 @@ const withPerPage = (path, n) => withParam(path, "per_page", n, { drop: ["page"]
  *  Two defects this works around, both in GET /contacts and both silent (a known pagination bug in the API):
  *
  *  1. THE ROWS ARE NOT UNIQUE. Pagination runs over a non-deterministic sort with no
- *     tiebreaker, so a single pass at per_page=100 returns fewer rows than the server's own
- *     count — some are DUPLICATES of rows already seen, and as many others never come back.
- *     This function used to hand that array straight back, so every caller silently received
- *     duplicate objects. Now deduped by id.
+ *     tiebreaker, so a single pass returns some rows twice and never returns others.
+ *     Rows are deduped by id.
  *
- *  2. A DIFFERENT ~5% IS MISSED EACH PAGE SIZE. Union across page sizes recovers most of it
- *     (measured 2026-08-26 across 100/75/50/25, which left about 3% still unreachable).
+ *  2. A DIFFERENT FEW PERCENT IS MISSED AT EACH PAGE SIZE. A union across page sizes
+ *     recovers most of it, but not all.
  *
  *  The extra passes only run when the first one comes up short against the server's own
  *  meta.totalItems, so endpoints that paginate correctly — /tasks, /notes, /assets all do —
@@ -346,19 +300,10 @@ export async function noanGetAll(path, { strict = false } = {}) {
   return out;
 }
 
-/** NOAN rejects a note whose `content` exceeds 25,000 characters — `400 InvalidArguments`,
- *  "content: Too big" — it does NOT truncate. The limit is absent from the OpenAPI spec, and
- *  the project CLAUDE.md points the other way, recommending `POST /notes` with "the full
- *  detail" as the escape hatch for the 2048-char cap on a task's `details`.
- *
- *  This bit the weekly activity report on 2026-09-02. A backlog purge closed
- *  283 long-stale tasks in four minutes, the report enumerated all 355 completions, and the
- *  body came to 25,136 characters. The run died — and it died at the LAST step, after the model
- *  synthesis had already been paid for, so the retry cost the full generation again.
- *
- *  Hence a cap that degrades instead of throwing: an over-long report still lands, truncated at
- *  a line boundary with a marker saying so, and the run completes. A truncated note is a visible
- *  problem someone can fix; a failed run is a silent gap in the record. */
+/** NOAN rejects a note whose `content` exceeds 25,000 characters (`400 InvalidArguments`,
+ *  "content: Too big"). It does NOT truncate, and the limit is absent from the OpenAPI spec.
+ *  The cap here degrades instead of throwing: an over-long report still lands, truncated at a
+ *  line boundary with a marker, and the run completes. */
 export const NOTE_CONTENT_CAP = 25000;
 
 /** Truncate `content` to fit NOTE_CONTENT_CAP, marking the cut. Returns it unchanged when it
@@ -388,8 +333,7 @@ export async function postNote(body) {
 
 /* ---------------- overflow: what a details trim would have deleted ----------
  * Task details cap at 2048 and every append trims to fit. Trimming agent
- * chatter is normal and expected. Deleting something a HUMAN wrote is not,
- * and until 2026-09-11 it happened silently.
+ * chatter is normal. Deleting something a HUMAN wrote is not.
  *
  * So when a trim is about to drop a human's [Note], the dropped text is
  * written to a NOAN note FIRST and the note's id goes into the marker that
@@ -429,9 +373,8 @@ export const OVERFLOW_MARK_ROOM = overflowMark("00000000-0000-0000-0000-00000000
  *  the note id, or null when the post failed.
  *
  *  NEVER throws. A failed note must not fail the write that triggered it:
- *  the caller falls back to the plain honest marker, which is exactly the
- *  behaviour before this existed. Losing the safety net is bad; losing the
- *  append as well would be worse. */
+ *  the caller falls back to the plain honest marker. Losing the safety net
+ *  is bad; losing the append as well would be worse. */
 export async function postOverflowNote(droppedText, { taskId = null, taskTitle = null, post = postNote, log = console.warn, seen = _overflowSeen } = {}) {
   const text = String(droppedText || "").trim();
   if (!text) return null;
@@ -477,10 +420,8 @@ export async function whoAmI() {
 
 /* ---------------- tags ---------------- */
 
-/* 5-min TTL (was cache-forever): fine for short-lived Actions workers either
- * way, but RESIDENT processes (the voice servers) held a boot-time snapshot
- * for their whole life — a tag created in the NOAN UI after boot stayed
- * invisible until redeploy (found live 2026-08-06: the Prospect tag). */
+/* 5-min TTL, not cache-forever: a resident process (the voice servers) must
+ * see a tag created in the NOAN UI after it booted. */
 let _tagCache = { at: 0, tags: null };
 async function allTags() {
   if (_tagCache.tags && Date.now() - _tagCache.at < 5 * 60_000) return _tagCache.tags;
@@ -497,13 +438,9 @@ export async function findTagId(name) {
 /**
  * Ensure a tag exists and return its id.
  *
- * NOTE: `POST /tags` DOES exist and is not deprecated (confirmed against the
- * live spec 2026-08-31; this comment claimed the opposite until 2026-09-04).
- * This helper still refuses to create one, and that is a policy choice rather
- * than an API limit: a tag is frequently a credential in this fleet — it arms
- * customer-facing automations — so an agent minting one on demand is how the
- * vocabulary drifts and how an automation gets armed by accident. Creating it
- * stays a human decision. (Used only for "needs-human".)
+ * `POST /tags` exists, but this helper never creates a tag: a tag often arms a
+ * customer-facing automation, so creating one stays a human decision.
+ * (Used only for "needs-human".)
  */
 export async function ensureTag(name) {
   const id = await findTagId(name);
@@ -514,17 +451,17 @@ export async function ensureTag(name) {
   );
 }
 
-/* ---------------- task metadata (readable since API v1.0.0, 2026-07-24) ----------------
- * GET /tasks now embeds tags[] {id,name}, assignees[] {id,name,email} and
+/* ---------------- task metadata ----------------
+ * GET /tasks embeds tags[] {id,name}, assignees[] {id,name,email} and
  * contacts[] {id,name} on every task. Agents trigger on
  *   trigger tag present  AND  the agent among the assignees
- * — never on the title. The [marker] title convention is retired. */
+ * and never on the title. */
 
 /** The agent's accepted identity ids — AGENT_IDENTITY_IDS (comma-separated),
  *  else AGENT_IDENTITY_ID; the fleet's VERITY_* names are read as a fallback.
  *  A project may hold more than one: the canonical writing identity and the
- *  identity humans pick in the UI when they assign the agent. `verityIds` is
- *  the historical name every caller uses; `agentIds` is the same function. */
+ *  identity humans pick in the UI when they assign the agent. `agentIds` is
+ *  the same function as `verityIds`. */
 export function verityIds() {
   return agentIdentityIds();
 }
@@ -533,17 +470,11 @@ export const agentIds = verityIds;
 /* ---------- who this process writes as ----------------------------------
  *
  * assertNoanKey and assertNoDowngrade check that a key is PRESENT and in the
- * right SLOT. Neither checks WHOSE it is, and until 2026-09-18 nothing had to:
- * a comment carried `createdByAssistant`, so an agent-authored comment was
- * marked as such by the server whoever's key wrote it.
- *
- * That field is gone. A comment is now attributed to the KEY'S OWNER and
+ * right SLOT, not WHOSE it is. A comment is attributed to the KEY'S OWNER and
  * nothing else, so `creator.id` is the entire basis on which
- * normalizeComments decides a comment is the agent's own and must not steer
- * it. If a worker posts status comments under a human's key, its own words
- * come back as that human's instruction and reach the approval gates — the
- * exact failure newsletter-approval already had once, when its self-guard was
- * inert (see the note there).
+ * normalizeComments decides a comment is the agent's own. A status comment
+ * posted under a human's key comes back as that human's instruction and
+ * reaches the approval gates.
  *
  * A deployment that splits its work across per-category keys (see
  * NOAN_AGENT_API_KEY above) has one NOAN user per key, so "is this key the
@@ -605,13 +536,9 @@ export function isAgentIdentity({ id = null, role = null } = {}) {
 
 /** Who the key belongs to, for code that acts on GET /me's identity.
  *
- *  A key used to be a PERSON's, so "the key's own identity" meant a human:
- *  fact alignment self-assigned its review to it, the grounding check filed
- *  gaps to it, the task worker fell back to its address as the requester.
- *  When a key belongs to the agent identity instead, each of those would hand
- *  work to the agent itself, or make an undeliverable address the requester.
- *  So `human` is the identity only when it is a person; callers fall through
- *  to their configured human when it is null. `isAgent` is false when /me
+ *  `human` is the identity only when it is a person, so work is never handed
+ *  to the agent itself or to an undeliverable agent address. Callers fall
+ *  through to their configured human when it is null. `isAgent` is false when /me
  *  failed, so a caller can tell "the agent" from "unknown". */
 export async function keyIdentity() {
   const c = await agentIdentityCheck();
@@ -648,8 +575,7 @@ export function taskAssignedToVerity(task) {
 
 /** The trigger predicate every agent shares: trigger tag AND the agent assigned.
  *  Never a completed task: status and the completed flag are independent in the
- *  API, and completed-but-backlog tasks are real (observed 2026-08-15 in
- *  voice-goals, 2026-08-26 in the voice brief) — acting on one re-runs work a
+ *  API, completed-but-backlog tasks exist, and acting on one re-runs work a
  *  human already closed. */
 export function taskTriggers(task, tagName) {
   return !task?.completed && taskHasTag(task, tagName) && taskAssignedToVerity(task);
@@ -681,13 +607,8 @@ export async function allTasksOnce() {   // per PROCESS RUN — never invalidate
 /** Record a task this process just created, so a second check in the same run
  *  sees it without another fetch.
  *
- *  Takes the externalId rather than trusting the create response to echo it.
- *  The OpenAPI spec says POST /tasks returns a full Task including externalId,
- *  but the spec and the API have already diverged on exactly this field
- *  elsewhere — POST /notes accepts externalId and the read shape never returns
- *  it. If the echo were ever missing, the cached row would carry no externalId,
- *  findTaskByExternalId would not match it, and this helper would silently stop
- *  doing the one thing it exists for. */
+ *  Takes the externalId rather than trusting the create response to echo it:
+ *  without it the cached row would never match findTaskByExternalId. */
 export function rememberTask(task, externalId = null) {
   if (!_taskCache || !task?.id) return;
   _taskCache.push(task.externalId ? task : { ...task, externalId });
@@ -705,11 +626,9 @@ export async function findTaskByExternalId(ext) {
  *  a snapshot taken at startup - which is exactly the wrong answer for "did a
  *  previous attempt already file this?".
  *
- *  It pages the whole board, because NOAN offers no way to ask. GET
- *  /tasks?externalId=... is not rejected: the parameter is ignored and the
- *  entire board comes back at HTTP 200 (verified live 2026-09-18 - 1,509 items
- *  for a one-task query). So this is deliberately not something to call on a
- *  happy path; call it where a retry is already known to be in progress. */
+ *  It pages the whole board, because GET /tasks?externalId=... ignores the
+ *  parameter and returns the entire board at HTTP 200. Do not call it on a
+ *  happy path, only where a retry is already known to be in progress. */
 export async function findTaskByExternalIdFresh(externalId) {
   return (await noanGetAll(`/tasks?per_page=100`)).find(t => t.externalId === externalId) || null;
 }
@@ -717,18 +636,9 @@ export async function findTaskByExternalIdFresh(externalId) {
 /**
  * Create a task only if one with this externalId is not already there.
  *
- * WHY THIS EXISTS, and why an externalId alone is not enough. NOAN does not
- * enforce uniqueness on externalId and offers no way to query by it: GET
- * /tasks?externalId=... is not rejected, it silently returns the WHOLE board
- * (verified live 2026-09-18, 1,509 items back for a one-task query). So the key
- * is a label until somebody reads it, and the only read available is paging the
- * board.
- *
- * That is not a theoretical gap. A sweep of the live board on 2026-09-18 found
- * 49 duplicate tasks across 22 externalIds - every one of them carrying the key
- * that was supposed to prevent it. The PR weekly sweep kept recommending "carry
- * an externalId on new write paths", and it would have prevented none of them:
- * the missing half was always the lookup.
+ * An externalId alone does not dedupe: NOAN does not enforce its uniqueness,
+ * and GET /tasks?externalId=... silently returns the WHOLE board. The key only
+ * works with a lookup, and the only lookup is paging the board.
  *
  * Use this where a create can genuinely be retried for the same logical event -
  * a cron that may run twice, an HTTP handler a client may call again, a queue
@@ -769,32 +679,25 @@ export async function createTaskOnce(body, { fresh = false, log = () => {} } = {
   return { task, created: true, id };
 }
 
-/* ---------------- a "note on the task" goes into details ----------------
- * There is no POST /tasks/{id}/notes. It 404s from Express's default handler
- * (verified live 2026-09-10), and there is no GET /tasks/{id} either. Every
- * worker that "left a note on the task" through that route, wrapped in a
- * catch, was writing nothing: the note vanished and the run carried on as if
- * it had landed. Task comments are readable (task-comments.mjs) but have no
- * write route yet. So a note is an entry appended to `details`, the way the
- * general agent has done it since the 2048 cap was found. PATCH replaces the
- * whole field, so the append starts from the text in hand and compacts to
- * the cap. These live here, not in the general agent's tools, so grants, missions
- * and the task worker can import them without pulling in the whole belt.
- * A test upstream fails CI on any return to the dead route. */
+/* ---------------- entries appended to task details ----------------
+ * There is no POST /tasks/{id}/notes (it 404s) and no GET /tasks/{id}. A status
+ * note is a comment (postTaskComment below). What still goes into `details` is
+ * appended here: PATCH replaces the whole field, so the append starts from the
+ * text in hand and compacts to the cap. These live here, not in the general
+ * agent's tools, so grants, missions and the task worker can import them.
+ * A test upstream fails CI on any use of the dead notes route. */
 
 /** Em dashes never reach a NOAN write (house style, and the model's tell). */
 export function sanitizeCopy(s) {
   return String(s ?? "").replace(/\s*[—―]\s*/g, " - ");
 }
 
-/** NOAN caps task details at 2048 chars (API-enforced, rejected not
- *  truncated; discovered in rehearsal). Compaction keeps the head (the
- *  requester's original brief) and the newest tail, and trims the middle.
+/** NOAN caps task details at 2048 chars (rejected, not truncated). Compaction
+ *  keeps the head (the requester's original brief) and the newest tail, and
+ *  trims the middle.
  *
- *  NARROWED 2026-09-19. The agent's own status notes are comments now
- *  (postTaskComment), which have a 25,000 cap and no trim, so nothing routine
- *  lands here any more. What is left writing to `details` is exactly two kinds
- *  of thing, and both are the reason this compaction is worth its complexity:
+ *  The agent's own status notes are comments (postTaskComment). Only two kinds
+ *  of thing write to `details`:
  *
  *    - a person's words the agent is CARRYING — the `[Note]` relays in
  *      the reply and voice relays. fitDetailsPreserving exists
@@ -803,9 +706,8 @@ export function sanitizeCopy(s) {
  *    - an ASK, whose answer is read straight back out of `details` by
  *      newTextSince(task.details, askSnapshot) — the only grant-creating path.
  *
- *  So the cap now guards human text almost exclusively. Before adding a caller,
- *  ask which of those two it is; if it is neither, it is a status note and
- *  belongs in a comment. A sweep upstream enforces that; this pack does not ship it. */
+ *  A new caller that is neither of those is a status note and belongs in a
+ *  comment. A sweep upstream enforces that; this pack does not ship it. */
 export const DETAILS_MAX = 2000;
 
 /** How much of ONE append survives when the details have to be compacted. Not
@@ -824,13 +726,8 @@ export function planDetails(prior, entry, { mark = "[...trimmed...]" } = {}) {
   const whole = String(entry);
   prior = String(prior || "");
 
-  // The fits-check comes FIRST. The ENTRY_MAX cap below is a budget for
-  // compaction — it bounds how much of the middle a single append can push out
-  // — and applying it before knowing whether compaction is needed truncated
-  // notes that would have fitted with room to spare. A 1,176-char handoff
-  // landed as 862 chars mid-sentence on 2026-09-18 into details that finished
-  // at 1,713 of 2,000, and the part lost was the "what is NOT done" section at
-  // the end. Nothing had to be dropped at all.
+  // The fits-check comes FIRST. ENTRY_MAX is a budget for compaction only;
+  // applying it before knowing compaction is needed cuts entries that fit.
   const full = prior ? `${prior}\n\n${whole}` : whole;
   if (full.length <= DETAILS_MAX) return { out: full, dropped: "", entryTrimmed: false };
 
@@ -842,10 +739,8 @@ export function planDetails(prior, entry, { mark = "[...trimmed...]" } = {}) {
    * whatever sits across it, and the way that fails is silent and specific:
    * a [Note] straddling the head boundary leaves its "[Note]" marker in the
    * head and its sentences in the dropped slice, so the overflow check below
-   * sees no human note and drops the body with nothing preserved. Found by
-   * the overflow fixture upstream, which is why that fixture puts
-   * a note exactly there. Snapping can only shrink head and tail, never grow
-   * them, so the cap maths stays safe. */
+   * sees no human note and drops the body with nothing preserved. Snapping
+   * can only shrink head and tail, never grow them, so the cap maths stays safe. */
   const snapBack = (s) => { const i = s.lastIndexOf("\n\n"); return i > 0 ? s.slice(0, i) : s; };
   const snapFwd = (s) => { const i = s.indexOf("\n\n"); return i >= 0 ? s.slice(i + 2) : s; };
 
@@ -865,12 +760,9 @@ export function fitDetails(prior, entry) {
  *  the dropped text is preserved in a NOAN note first and the marker cites its
  *  id. Returns { details, noteId }.
  *
- *  `entry` is used VERBATIM — no author stamp — because the callers that most
- *  need this are recording a human's OWN words: reply-worker writes
- *  "[Note] Reply from <email>" for an emailed answer, slack-worker writes
- *  "[Note] <email> in Slack" for a thread reply. Those two are how most human
- *  [Note] text reaches a task in the first place, and they trimmed without
- *  any protection until 2026-09-11.
+ *  `entry` is used VERBATIM, with no author stamp, because the callers that most
+ *  need this record a human's OWN words (reply-worker writes "[Note] Reply from
+ *  <email>" for an emailed answer).
  *
  *  Only a human [Note] triggers a note; routine agent chatter does not, or a
  *  task at the cap would spawn one per append. A failed preserve falls back to
@@ -920,15 +812,13 @@ export async function appendTaskDetails(task, text, { author = agentName(), patc
   if (!task?.id) throw new Error("appendTaskDetails: no task id");
   const prior = task.details || "";
   const entry = `[${author} ${detailsStamp()}] ${sanitizeCopy(text)}`;
-  // The compaction trims the MIDDLE of the prior details. Agent chatter going
-  // that way is routine; a human's [Note] going that way is the silent loss
-  // fixed on 2026-09-11. When one is on its way out, preserve
-  // the dropped slice in a note first and cite it in the marker.
+  // The compaction trims the MIDDLE of the prior details. When a human's [Note]
+  // is on its way out, preserve the dropped slice in a note first and cite it.
   const { details: next, entryTrimmed } = await fitDetailsPreserving(prior, entry, { preserve, taskId: task.id, taskTitle: task.title });
-  // Two different events, and only one of them is routine. `trimmed` has always
-  // meant "something got shorter", which is the normal compaction of old
-  // chatter. `entryTrimmed` means THE TEXT YOU JUST WROTE was cut - a caller
-  // that cannot tell them apart cannot know its handoff lost its ending.
+  // Two different events, and only one of them is routine. `trimmed` means
+  // "something got shorter", which is the normal compaction of old chatter.
+  // `entryTrimmed` means THE TEXT YOU JUST WROTE was cut - a caller that
+  // cannot tell them apart cannot know its handoff lost its ending.
   if (entryTrimmed) {
     console.warn(`  warn: the note appended to task ${task.id} was cut to ${ENTRY_MAX} chars to fit; `
       + `${entry.length - ENTRY_MAX} char(s) were dropped from its END. Post the long form with postNote() and cite the note id.`);
@@ -988,8 +878,8 @@ export async function postTaskComment(taskId, body, { name = agentName() } = {})
   // unmarked agent comment is read back as teammate steering: the one outcome
   // this whole mechanism exists to prevent.
   const text = buildAgentComment(fitComment(String(body ?? ""), COMMENT_MAX - markerOverhead(name)), taskId, { name });
-  // Belt and braces, and deliberately not specific to the bug above: if ANY
-  // path ever yields an unmarked comment, it must not reach the board.
+  // Belt and braces: if ANY path ever yields an unmarked comment, it must not
+  // reach the board unless the key is the agent's own.
   if (!hasAgentMarker(text) && !(await agentIdentityCheck()).ok) {
     throw new Error("postTaskComment: refusing to post an UNMARKED comment — it would be read back as the key owner's own words");
   }
@@ -1044,14 +934,9 @@ export async function assignVerity(task) {
 
 /** Add identities to a task's assignees, PRESERVING everyone already on it.
  *
- *  The claim-side mirror of the bug parkForHuman exists to stop. PUT
- *  /tasks/{id}/assignees replaces the whole set, so `assigneeIds: [me]` on a
- *  task that came off the board removes whoever else was on it — and the
- *  fleet's shared trigger predicate (taskTriggers: trigger tag AND the agent
- *  assigned) selects exactly the tasks a human has handed back by re-assigning
- *  the agent in the UI. A human who hands their own task back and stays on it was
- *  silently dropped from it by the worker's claim() until 2026-09-13, which is
- *  invisible from their side: the task simply stops being theirs.
+ *  PUT /tasks/{id}/assignees replaces the whole set, so `assigneeIds: [me]`
+ *  removes whoever else was on the task, including a human who handed it back
+ *  to the agent and stayed on it.
  *
  *  Unlike assignVerity this decides nothing about WHO — each caller keeps its
  *  own identity constant (AGENT_IDENTITY_ID, a reviewer list, a resolved
@@ -1062,12 +947,9 @@ export async function assignVerity(task) {
  *  Base is the task IN HAND, no re-read — same convention as parkForHuman and
  *  appendTaskDetails.
  *
- *  ALWAYS returns who is on the task afterwards, whether or not a PUT was sent
- *  — a caller asking "is this person on it now" gets the same answer either
- *  way, which an empty return for the already-present case did not give
- *  (a review finding). The PUT is skipped when nothing would change: re-writing
- *  an unchanged set is a wasted call, and on this endpoint every write is a
- *  chance to lose someone. */
+ *  ALWAYS returns who is on the task afterwards, whether or not a PUT was sent.
+ *  The PUT is skipped when nothing would change: on this endpoint every write
+ *  is a chance to lose someone. */
 export async function addTaskAssignees(task, ...ids) {
   if (!task?.id) throw new Error("addTaskAssignees: no task id");
   const have = new Set((task.assignees || []).map(a => a.id).filter(Boolean));
@@ -1091,16 +973,11 @@ export async function unassignVerity(task) {
 /* ---------------- parking a task for a human ----------------
  *
  * "Parked" is the fleet's hand-back state: the task carries `needs-human`,
- * the agent is off the assignees, and re-assigning it is the retry. Until
- * 2026-09-10 roughly twenty files hand-rolled that as tag + unassign and
- * NOBODY was added, so a parked task had no human on it and the only thing
- * that ever read the tag back was the weekly board sweep. The board that day:
- * 16 open needs-human tasks, 14 with no human assignee — eight site-preview
- * parks and four support escalations the CS owner had only been emailed about.
+ * the agent is off the assignees, and re-assigning it is the retry.
  *
- * parkForHuman() is the one place the park is written (a source-read test,
- * a test upstream fails CI on a raw needs-human write elsewhere) and
- * it ALWAYS leaves a human on the task. Who, in order:
+ * parkForHuman() is the one place the park is written (a test upstream fails
+ * CI on a raw needs-human write elsewhere) and it ALWAYS leaves a human on
+ * the task. Who, in order:
  *
  *   1. `assignees` passed explicitly (an agent with its own pinned list, e.g.
  *      CI_ALERT_ASSIGNEES, REPLY_HUMAN_ASSIGNEES) — used as given;
@@ -1256,14 +1133,10 @@ export async function parkForHuman(task, {
   /* `status: null` from a caller means "leave it where it is" - a wound-down
    * in-progress task should stay in-progress, not slide back to backlog.
    *
-   * But a park is BY DEFINITION waiting on a human, and on this board a task
-   * with no status is waiting on nobody: that is what null status is reserved
-   * for, and the only thing it means (decided 2026-09-11). So parking a task
-   * that is in no column puts it in backlog -
-   * otherwise the park is invisible to every ?status= query, including the
-   * board sweep that exists to find neglected parks. A hand-made Site Build
-   * task was the case that surfaced it: six site-builder call sites pass
-   * status:null, and any of them could park a column-less task into silence. */
+   * But a park is waiting on a human, and a task with no status means
+   * waiting on nobody. So parking a task that is in no column puts it in
+   * backlog, or the park is invisible to every ?status= query, including the
+   * board sweep that finds neglected parks. */
   const wanted = status || (task.status ? null : "backlog");
   if (wanted) {
     try { await noanPatch(`/tasks/${task.id}`, { status: wanted }); out.status = wanted; }
@@ -1276,22 +1149,12 @@ export async function parkForHuman(task, {
     await noanPut(`/tasks/${task.id}/assignees`, { assigneeIds: next });
     out.assigned = next;
   } catch (e) { out.errors.push(`assignees: ${e.message}`); log(`  warn: [${label}] could not write assignees on ${task.id}: ${e.message}`); }
-  /* A task born in a Slack thread is answered IN that thread. Until
-   * 2026-09-11 only the general lane knew that: delegation wrote the pointer into a
-   * delegated child's details, and the general agent was the only reader, so a
-   * child carrying a specialist tag (deck, demo, social, site-build) was
-   * worked by a lane with no Slack notion and parked by EMAIL while the
-   * requester sat in the thread waiting.
+  /* A task born in a Slack thread is answered IN that thread, whichever lane
+   * parks it. It lives here because every park goes through parkForHuman.
    *
-   * It goes here because parkForHuman is already the one door every park
-   * goes through - the same reason the assignee step lives here. A lane does
-   * not have to know about Slack to answer where it was asked.
-   *
-   * The email is NOT replaced. The thread is where the REQUESTER is waiting;
-   * the park's owner may be someone else entirely who is not in it. That is
-   * the fleet's existing answer (the general agent keeps email as a backstop
-   * until SLACK_ONLY_NOTIFY=1, a staged flip) and this follows it rather
-   * than inventing a second convention.
+   * The email is NOT replaced: the thread is where the REQUESTER waits, and the
+   * park's owner may not be in it. The general agent keeps email the same way
+   * until SLACK_ONLY_NOTIFY=1.
    *
    * Fail-soft, like every other step here: no token, no pointer, or a Slack
    * error costs the park nothing. */
@@ -1329,12 +1192,9 @@ async function notifyParkThread(task, { reason, agent, assigned, log = console.l
  * park is (requester → per-agent → lane → ENG).
  *
  * A task nobody is on is a task nobody sees: it appears in no one's list and
- * sends no notification, so "a human will triage it" quietly means nobody
- * does. On 2026-09-11, 33 of 115 open tasks had no assignee — every one of
- * them a deliberate choice made before parkForHuman existed, each reasoning
- * the same way in a different file.
+ * sends no notification.
  *
- * The rule is now: every created task has a human, UNLESS the agent is assigned
+ * Every created task has a human, UNLESS the agent is assigned
  * (it is working it) or it is one of two documented resting states — a
  * pipeline record, or a fact candidate the Monday run consumes and closes
  * either way. A test upstream holds that line.
@@ -1343,7 +1203,7 @@ async function notifyParkThread(task, { reason, agent, assigned, log = console.l
  * REPLACES the whole set - it cannot merge with assignees it has not read.
  * On a fresh task that is exactly right and saves a read; on a task that may
  * already carry someone, pass their ids as `keep` or you will silently
- * remove them. Every caller today creates the task two lines above.
+ * remove them.
  *
  * Fail-soft like parkForHuman: a task that exists unassigned is better than a
  * thrown worker, and the result says what landed. */
@@ -1381,24 +1241,15 @@ export function taskContactId(task) {
 }
 
 /* ---------------- contacts by email ----------------
- * GET /contacts?q= matches `name` ONLY — it never looks at `email`. An email
- * search therefore returns 0 items for a contact that plainly exists, and a
- * 200-with-nothing reads exactly like "no such contact".
+ * GET /contacts?q= matches name, alias and website, never `email`. An email
+ * search can return 0 items for a contact that exists, and a 200-with-nothing
+ * reads exactly like "no such contact". It only hits when the address
+ * fuzzy-matches one of those fields, so it looks like it works.
  *
- * It looks like it works, which is why it survived so long: a hit happens when
- * the email string fuzzy-matches the NAME, so contacts created by our own
- * capture surfaces (named `email.split("@")[0]`) match themselves, and contacts
- * created anywhere else usually don't. Measured 2026-09-04 over 40 random live
- * contacts looked up by their own address: 15 missed — 38%.
- *
- * Every one of those misses is a duplicate contact, and on the website chat it
- * was worse than that: `isSubscriber` is derived from this lookup, so a missed
- * subscriber got served the prospect script with the support path disabled.
- *
- * The shape below is the one the voice app's auth has been running since
- * 2026-08-11 (it found the same thing independently, on recently-written
- * contacts): try `q=` first because it is one cheap request and usually right,
- * then fall back to an exact email match over the full list.
+ * A missed lookup creates a duplicate contact, and anything derived from it
+ * (the website chat's `isSubscriber`) is wrong too. So: try `q=` first because
+ * it is one cheap request, then fall back to an exact email match over the
+ * full list.
  *
  * A fallback sweep can still MISS — noanGetAll warns when its read is a floor
  * rather than a census — so this makes duplicates rare, not impossible.
@@ -1419,8 +1270,7 @@ const CONTACTS_CACHE_MS = 60_000;
 /** Extra full sweeps to spend before believing a MISS. Only the miss path pays for these.
  *
  *  Two is the useful number, not three: one pass to read, one to prove the read has stopped
- *  changing. Measured on a live project: three consecutive union sweeps returned an identical
- *  row set — the loss is deterministic, so a third pass is a page of requests for nothing. */
+ *  changing. The loss repeats from sweep to sweep, so a third pass buys nothing. */
 const CONTACT_SWEEP_ROUNDS = 2;
 
 /** Contacts the list endpoint CANNOT return, by id. Supplied by the deployment, EMPTY by default.
@@ -1435,9 +1285,9 @@ const CONTACT_SWEEP_ROUNDS = 2;
  *  blind to the addresses most at risk of being duplicated — there is no DELETE /contacts, so
  *  each of those duplicates would be permanent.
  *
- *  NOT hardcoded, and that is the point: a row id is meaningful only inside the project it came
- *  from. Baked into shipped code it 404s eight times per miss in every other project and leaks
- *  the origin project's internals; the export sweep now fails on a bare id in code.
+ *  Never hardcode ids: a row id is meaningful only inside its own project, and baked into
+ *  shipped code it 404s elsewhere and leaks the origin project's internals. The export sweep
+ *  fails on a bare id in code.
  *  Set NOAN_UNREACHABLE_CONTACT_IDS (comma or whitespace separated) where a project needs it.
  *  Ids, not emails, deliberately: an id carries no personal data.
  *
@@ -1483,11 +1333,9 @@ async function contactSnapshot({ rounds = 1 } = {}) {
   }
   let reportedTotal = _contactsByEmailCache.reportedTotal;
 
-  // CONVERGED, not "reached meta.totalItems". That test was unsatisfiable: the list endpoint
-  // cannot return every row (a known API pagination bug), so `seen >= reportedTotal` was permanently false and every
-  // caller that gated a write on it refused FOREVER — measured live, a sweep short of the total.
-  // What is actually knowable from here is whether the read has stopped changing: a full extra
-  // pass that finds nobody new means we have everything the API is willing to give.
+  // CONVERGED, not "reached meta.totalItems": the list endpoint cannot return every row (a known
+  // API pagination bug), so that test never passes. A full extra pass that finds nobody new means
+  // we have everything the API is willing to give.
   let converged = false;
   for (let round = 0; round < rounds; round++) {
     const before = byId.size;
@@ -1515,18 +1363,12 @@ async function contactSnapshot({ rounds = 1 } = {}) {
  *  CONVERGED: a full extra pass that found nobody new means we have everything the API is
  *  willing to hand over, which is the most any client can establish (a known API pagination bug).
  *
- *  It is deliberately NOT "we saw every row meta.totalItems claims". That is unreachable — the
- *  list endpoint drops rows inside large tie groups — and gating on it made every miss untrusted
- *  forever, which is its own data loss: reply-worker escalated every unknown sender to a human
- *  rather than filing them.
+ *  It is deliberately NOT "we saw every row meta.totalItems claims": the list endpoint drops rows
+ *  inside large tie groups, so that test never passes and every miss would stay untrusted.
  *
- *  The old caution still stands and is why the miss path is expensive. An established contact —
- *  long-standing, with memos, linked tasks and an open support case — was absent from four
- *  consecutive union sweeps, was reported by network-integrity as an active paying customer
- *  with no contact record, and was duplicated by a script whose guard treated the miss as
- *  absence. There is no DELETE /contacts, so that duplicate is permanent. Any ids configured in
- *  NOAN_UNREACHABLE_CONTACT_IDS are read directly before a create, which covers exactly that
- *  case for the rows a project knows about. */
+ *  The miss path is expensive on purpose: an established contact can be absent from several
+ *  consecutive union sweeps, and there is no DELETE /contacts, so a duplicate is permanent. Any
+ *  ids in NOAN_UNREACHABLE_CONTACT_IDS are read directly before a create. */
 export async function lookupContactByEmail(email) {
   const needle = String(email ?? "").trim().toLowerCase();
   if (!needle) return { contact: null, complete: true, seen: 0, reportedTotal: 0, unreadable: 0 };
@@ -1588,38 +1430,15 @@ function rememberContact(contact) {
 
 /** Create a contact, and treat the API's duplicate refusal as a find.
  *
- *  THE API DOES NOT DEDUPE CONTACTS. Checked directly against the live service on
- *  2026-09-19: contact creation runs straight into the write with no email check,
- *  and POST /contacts does not answer 409 on an address that already exists.
+ *  THE API DOES NOT DEDUPE CONTACTS: POST /contacts does not check the email and
+ *  does not answer 409 on an address that already exists. The 409 branch below is
+ *  DEFENSIVE AND CURRENTLY DEAD. Do not reason from it: the lossy lookup above is
+ *  the ONLY check, and a miss it gets wrong is a permanent duplicate, because there
+ *  is no DELETE for contacts.
  *
- *  So the 409 branch below is DEFENSIVE AND CURRENTLY DEAD. It is kept because it
- *  costs nothing and is the right shape if that ever changes — not because it
- *  fires today. Do not reason from it: the lossy lookup above is not a fast path
- *  in front of a server check, it is the ONLY check, and a miss it gets wrong is a
- *  permanent duplicate, because there is no DELETE for contacts.
- *
- *  This comment asserted the opposite until 2026-09-19, and the claim escaped into
- *  a second module and a third author's reasoning before anyone re-checked it. It
- *  began as an attributed, forward-looking sentence — "since <change>, the server
- *  dedupes" — written while that change was expected to land. The change never
- *  landed, and a later pass stripped the reference as an internal pointer, which
- *  left the claim standing alone as a statement of present fact.
- *
- *  So: never write a forward-looking or conditional fact into a shipped comment.
- *  The qualifier that made it honest is exactly what a tidy-up deletes, and what
- *  remains reads as verified. State what is true now, or say plainly that it is
- *  not true yet.
- *
- *  Use this for EVERY create. A bare `noanPost("/contacts", ...)` throws on the
- *  409 — `call()` does not retry a 4xx — which turns "silently made a duplicate"
- *  into "the run died". Two tests fail CI on a return to the raw call, and the
- *  split matters to whoever is reading this file: test-generic-config.mjs sweeps
- *  the shipped closure and travels WITH this module, so the rule holds wherever
- *  this file runs; test-contact-create-409.mjs additionally walks fleet-only
- *  paths and stays behind. This paragraph named only the second one until
- *  2026-09-20, which promised a downstream reader a guard that was not there —
- *  the same mistake as the paragraph above, one level up: a claim true in the
- *  tree it was written in and false in the tree it ships to.
+ *  Use this for EVERY create, never a bare `noanPost("/contacts", ...)`.
+ *  test-generic-config.mjs fails CI on the raw call in the shipped closure, and
+ *  test-contact-create-409.mjs also walks fleet-only paths.
  *
  *  Returns `{ contact, created }`. Throws on anything else, and on a 409 we
  *  cannot resolve: "the server refused, and we cannot say who owns the address"
@@ -1650,14 +1469,7 @@ export async function createContact(body) {
 
 /** Find the contact with this email, or create it.
  *
- *  The five-line find-or-create block that was copy-pasted into four website
- *  surfaces and sdr-reply-worker, each with the broken lookup and each with its
- *  own guess at the create response shape. POST /contacts returns
- *  `{contact:{...}}`, but that convention is undocumented and has already
- *  diverged elsewhere, so read both shapes.
- *
- *  Returns `{ contact, created }`. `name` defaults to the address's local part,
- *  which is what every caller was already doing. */
+ *  Returns `{ contact, created }`. `name` defaults to the address's local part. */
 export async function findOrCreateContactByEmail(email, { name, website, tagIds, allowIncompleteSweep = false } = {}) {
   const needle = String(email ?? "").trim().toLowerCase();
   if (!EMAIL_RX.test(needle)) throw new Error(`findOrCreateContactByEmail: not an email: ${email}`);
@@ -1668,13 +1480,8 @@ export async function findOrCreateContactByEmail(email, { name, website, tagIds,
   // A miss we cannot trust must not become a create. Creating is irreversible — the API has no
   // DELETE on contacts — so the asymmetry is total: refusing costs a retry, creating costs a
   // permanent duplicate on a record that may already carry memos, tasks and an open case.
-  // Both callers already handle this throw the right way: the email path escalates to a human
-  // ("better a parked email than a reply to nobody on record") and the command path refuses.
-  //
-  // "Cannot trust" now means the read never SETTLED. It used to mean "we saw fewer rows than
-  // meta.totalItems", which the list endpoint makes permanently true (a known API pagination bug) — so this threw on
-  // every single create, and the two callers' careful handling turned into "no contact is ever
-  // filed". A guard that always fires is not a guard.
+  // "Cannot trust" means the read never SETTLED, not "fewer rows than meta.totalItems": the list
+  // endpoint makes that permanently true, and a guard that always fires files no contact ever.
   if (!complete && !allowIncompleteSweep) {
     const e = new Error(
       `refusing to create a contact for ${needle}: two full sweeps were still returning new rows ` +
@@ -1699,9 +1506,7 @@ export async function findOrCreateContactByEmail(email, { name, website, tagIds,
   if (tagIds?.length) body.tagIds = tagIds;
 
   // Nothing behind this: the sweep above IS the dedupe, because the server does
-  // not check (see createContact). createContact's 409 branch would catch a miss
-  // if a guard ever landed, but today a wrong answer above becomes a permanent
-  // duplicate.
+  // not check (see createContact). A wrong answer above is a permanent duplicate.
   return createContact(body);
 }
 
@@ -1743,30 +1548,24 @@ export async function searchContacts(q, { perPage = 10 } = {}) {
   return hit ? [hit, ...items] : items;
 }
 
-/* ---------------- contact memos (readable since API v1.0.0, 2026-07-24) ----------------
- * GET /contacts/{id} returns the contact's full memo history — Granola meeting
- * summaries, agent send-records, CS exchanges. Memos were write-only before, so
- * agents built earlier worked blind to this history.
+/* ---------------- contact memos ----------------
+ * GET /contacts/{id} returns the contact's full memo history: meeting
+ * summaries, agent send-records, CS exchanges.
  *
  * Note the shape split: GET /contacts returns ContactSummary (8 fields, no memos);
  * only GET /contacts/{id} carries `memos`, `notes`, `companyRoles` and `tasks`. */
 
 /**
- * Append one memo to a contact. THE single write path for contact memos — every
- * agent goes through here rather than calling the endpoint directly, so the next
- * time this route moves it is one edit and not thirty-eight.
+ * Append one memo to a contact. THE single write path for contact memos: every
+ * agent goes through here rather than calling the endpoint directly.
  *
- * Writes POST /contacts/{id}/memos. POST /contacts/{id}/notes is deprecated in the
- * live spec, as is Contact.notes in favour of Contact.memos. The two are views of
- * the SAME store — a memo written here also appears in the deprecated `notes`
- * array, and vice versa (verified across live contacts 2026-08-31) — so readers on
- * either field keep working and this migration needed no cutover.
+ * Writes POST /contacts/{id}/memos (POST /contacts/{id}/notes is deprecated). Memos
+ * and the deprecated `notes` array are views of the SAME store, so readers on
+ * either field see a memo written here.
  *
- * `title` is the one thing the old route could not do. Left optional and unset by
- * default: the fleet encodes an `[Agent] ...` prefix in the content instead, and
- * lifting those into real titles is a per-agent change, not part of moving route.
- * Where a title IS set it becomes an idempotency marker — see contact-enrich.mjs,
- * which finds its own prior memo by title rather than by matching content.
+ * `title` is optional and unset by default: the fleet encodes an `[Agent] ...`
+ * prefix in the content instead. Where a title IS set it is an idempotency marker
+ * (contact-enrich.mjs finds its own prior memo by title).
  */
 export async function addContactMemo(contactId, content, title = null) {
   const memo = { content: String(content ?? "") };
@@ -1777,7 +1576,7 @@ export async function addContactMemo(contactId, content, title = null) {
 /**
  * The most recent memos for a contact, formatted as prompt context.
  * Fail-soft: returns null on any error (a missing history is context, not a
- * reason to abort). Newest-last as stored; we take the tail.
+ * reason to abort). Newest-first as stored; we take the head.
  */
 export async function fetchContactMemos(contactId, { maxNotes = 8, maxCharsPer = 1200, budget = 7000 } = {}) {
   try {
@@ -1790,21 +1589,8 @@ export async function fetchContactMemos(contactId, { maxNotes = 8, maxCharsPer =
 
 /** The selection half of fetchContactMemos, pure so it can be tested.
  *
- *  ⚠ `notes` arrives NEWEST-FIRST. This used to read `slice(-maxNotes).reverse()`
- *  — "newest last, take the tail" — which is the opposite, and it did not merely
- *  invert the order: past `maxNotes` it dropped the newest memos entirely.
- *
- *  Verified live 2026-09-04. one contact has 13 memos; the five most recent
- *  (all 2026-09-02) fell outside `slice(-8)`, so every agent grounding on his
- *  history read it as ending 2026-08-31. another, with 9 memos, lost only
- *  the newest — the single one most likely to matter.
- *
- *  Twelve workers read contact history through this (reply, reengage, trial,
- *  course, activation, onboard, precog, general-tools, worker, demo-script),
- *  several of them to answer "what did we last say to this person?" — which is
- *  exactly the question the old slice answered with the oldest thing on file.
- *  It stayed invisible because a contact needs MORE than maxNotes memos to lose
- *  anything, and most have fewer. */
+ *  `notes` arrives NEWEST-FIRST, so take the head. A tail slice would drop the
+ *  newest memos once a contact has more than `maxNotes`. */
 export function selectRecentMemos(notes, { maxNotes = 8, maxCharsPer = 1200, budget = 7000 } = {}) {
   const all = Array.isArray(notes) ? notes : [];
   if (!all.length) return null;
@@ -1830,8 +1616,7 @@ function londonDay(d) {
 }
 
 /**
- * Due gate. A task with no dueDate is due immediately (pre-dueDate tasks and
- * hand-written ones keep working). One with a dueDate becomes due once its
+ * Due gate. A task with no dueDate is due immediately. One with a dueDate becomes due once its
  * London calendar date is today or earlier — the demo pipeline dates tasks
  * "+3 working days at 09:00 London" and this is the other half of that clock.
  */
@@ -1843,17 +1628,15 @@ export function taskDueNow(task, now = new Date()) {
 }
 
 /**
- * Backlog tasks to process: the standard trigger (tag + the agent assigned —
- * the old title/"#tag" convention is retired) that are
- * due now. Oldest dueDate first so overdue tasks can't starve behind the cap.
+ * Backlog tasks to process: the standard trigger (tag + the agent assigned)
+ * that are due now. Oldest dueDate first so overdue tasks can't starve behind the cap.
  */
 export async function listBacklogTasks({ tagName = "follow-up", limit = 3 } = {}) {
   const all = await noanGetAll(`/tasks?status=backlog&per_page=100`);
   const triggered = all.filter(t => taskTriggers(t, tagName));   // taskTriggers also drops completed tasks
   const due = triggered.filter(t => taskDueNow(t));
   const waiting = triggered.length - due.length;
-  // Name the actual tag: this helper now serves every dated agent, and an
-  // agent-ideas run reporting "follow-up task(s) waiting" reads as a bug.
+  // Name the actual tag: this helper serves every dated agent.
   if (waiting > 0) console.log(`noan: ${waiting} ${tagName} task(s) waiting on a future dueDate`);
   due.sort((a, b) => new Date(a.dueDate || 0) - new Date(b.dueDate || 0));
   return due.slice(0, limit);

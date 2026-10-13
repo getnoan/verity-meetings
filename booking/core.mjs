@@ -47,9 +47,8 @@ export const HOST_TZ_TTL_MS = 15 * 60_000;
 const PARKED_RETRY_MS = 6 * 3600_000;
 // A call that never answers must become a failure, not a hang: a pending
 // promise holds the booking's lock forever, and the sweeper, which works
-// bookings one at a time, would wait behind it for good. Seen live on
-// 2026-09-15: NOAN created the contact, its reply never came, nothing was
-// recorded. NOAN items get room for the contact lookup, which sweeps every
+// bookings one at a time, would wait behind it for good. NOAN items get room
+// for the contact lookup, which sweeps every
 // contact when the name search misses (~50s at ~800 contacts).
 const NOAN_ITEM_DEADLINE_MS = 150_000;
 const CALENDAR_DEADLINE_MS = 60_000;
@@ -89,10 +88,9 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
   }
   const base = String(publicUrl || "").replace(/\/$/, "");
   // The crm.apply a deadline gave up on, per booking, while it is still running. withDeadline
-  // is a Promise.race: losing the race abandons the WAIT, not the work. Between 2026-09-24 and
-  // 09-29 five bookings got two open tasks each this way: the first book item ran past the
-  // deadline (attempts went to 1), kept going, and filed its task after the sweeper's retry had
-  // already searched the board and found nothing. The board search cannot close that window;
+  // is a Promise.race: losing the race abandons the WAIT, not the work. A book item that runs past
+  // the deadline keeps going and can file its task after the sweeper's retry has already searched
+  // the board and found nothing, which leaves two open tasks. The board search cannot close that window;
   // waiting for the earlier attempt can, and one process (see locks) is what makes this map
   // the whole truth.
   const inflight = new Map();
@@ -115,7 +113,7 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
     return tz || null;
   }
 
-  /** The zone to show a booking in; a type that is no longer offered falls back to the config's. */
+  /** The zone to show a booking in; a type that isn't offered falls back to the config's. */
   const tzForRow = async (type, cfg) => (type ? (await availFor(type, cfg)).timeZone : cfg.avail.timeZone);
 
   /** cfg.avail with the timezone resolved for this type. Everything downstream reads it. */
@@ -226,7 +224,7 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
       const done = await withLock(id, async () => {
         // An earlier attempt still running gets one more deadline to finish before this one
         // starts. Bounded, so an attempt that never answers can't block the booking for good:
-        // past it, the retry goes ahead on the row and the board lookup as before.
+        // past it, the retry goes ahead on the row and the board lookup.
         const prior = inflight.get(id);
         if (prior) {
           await withDeadline(prior.catch(() => {}), noanItemMs, "an earlier NOAN attempt")
@@ -272,7 +270,7 @@ export function createBookingCore({ store, calendar, crm, config, publicUrl, now
 
   /** Queue a `held` item on every booking whose meeting ended (past the grace) and whose NOAN
    *  side has not been touched since: noan_synced_at before end_at. Once the item runs,
-   *  noan_synced_at moves past end_at, so each booking is queued once. No schema change. */
+   *  noan_synced_at moves past end_at, so each booking is queued once. */
   async function queueHeld() {
     if (!store.listEnded) return 0;
     const t = now().getTime();

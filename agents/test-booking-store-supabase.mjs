@@ -1,7 +1,6 @@
 /**
  * booking/store-supabase.mjs error mapping, against the response shapes the
- * live fleet PostgREST returned on 2026-09-15 when the booking_bookings table
- * was first exercised: an overlap (exclusion constraint, 23P01) comes back as a
+ * live fleet PostgREST returns: an overlap (exclusion constraint, 23P01) comes back as a
  * 400, a reused token (unique, 23505) as a 409. Both must be StoreConflict, so
  * a guest racing another for one slot hears "that time was just taken", not a
  * 503. Anything else still throws a plain error. No network.

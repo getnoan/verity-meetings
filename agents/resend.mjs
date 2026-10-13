@@ -8,17 +8,11 @@
  * injection. We send an idempotency key so re-runs of the worker can't double-send
  * the same task's email.
  *
- * Env guard (2026-09-09): RESEND_API_KEY and MAIL_FROM are read at CALL time
- * and their absence is a named error, never a request. Before this, a missing
- * key went out as `Authorization: Bearer undefined` and Resend answered 401
- * "invalid API key" — the same message a revoked key produces — so the
- * hand-built service that ran the Slack companion, which shipped without the
- * variable, spent nine days reporting a bad key while the key was
- * fine and the dashboard showed nothing (the requests never authenticated, so
- * they never appeared). fetchEmailStatus had the same hole: 50/50
- * "lookup_failed" that read as a fleet-wide auth failure. A missing variable
- * and a bad credential are different problems owned by different people; the
- * error must say which. Tested by test-resend-env-guard.mjs.
+ * Env guard: RESEND_API_KEY and MAIL_FROM are read at CALL time and their
+ * absence is a named error, never a request. A missing key sent as `Bearer
+ * undefined` gets the same 401 as a revoked key, and a missing variable and a
+ * bad credential are different problems: the error must say which. Tested by
+ * test-resend-env-guard.mjs.
  */
 
 const RESEND_URL = "https://api.resend.com/emails";
@@ -82,18 +76,16 @@ export async function sendEmail({ to, subject, html, text, idempotencyKey, heade
     err.code = payload?.name || payload?.error?.name || null;
     throw err;
   }
-  // delivery-stats send log (2026-07-26): best-effort, never blocks a send
+  // delivery-stats send log: best-effort, never blocks a send
   if (payload?.id) appendSendLog({ id: payload.id, to: body.to, subject: body.subject });
   // spend ledger (usage-log.mjs): same best-effort contract
   await recordUsage({ provider: "resend", units: body.to.length });
   return payload; // { id: "..." }
 }
 
-/* ---------------- batch sends (added 2026-09-21) ----------------
+/* ---------------- batch sends ----------------
  * POST /emails/batch: up to 100 emails in ONE request, each with its own `to`,
- * subject, html, text, headers and tags. Added for the newsletter, which sent one
- * request per recipient at 600 ms spacing: 1,000 recipients took ten minutes and
- * 1,000 requests.
+ * subject, html, text, headers and tags.
  *
  * PERMISSIVE by default. Resend validates a batch as a whole unless the request
  * carries `x-batch-validation: permissive` (the header the official SDK sets
@@ -124,12 +116,9 @@ export const BATCH_MAX = 100;
  * say only that failures come back in `errors`, not whether `data` keeps a
  * slot for them, so both shapes are read:
  *   data.length === n                 index-aligned (a failed slot may be empty)
- *   data.length === n - errors.length the successes, in input order. This is
- *                                     what Resend returned when probed on
- *                                     2026-09-21 (3 emails, 1 malformed: two
- *                                     ids, errors[{ index: 1 }], status 202),
- *                                     and an identical retry with the same
- *                                     key replayed the same two ids.
+ *   data.length === n - errors.length the successes, in input order (what
+ *                                     Resend returns in practice; an identical
+ *                                     retry with the same key replays the same ids).
  * Anything else is accepted-but-unmatched: those emails WENT, so they are
  * reported ok with id null rather than as failures, because a caller that
  * reads "failed" would send them again.
@@ -205,7 +194,7 @@ export async function cancelEmail(id) {
   }
 }
 
-/* ---------------- periodic report sends (added 2026-08-13) ----------------
+/* ---------------- periodic report sends ----------------
  * Every scheduled report worker (pr-sweep, board-sweep, fact-alignment,
  * weekly-activity-report, growth/product/market refreshes) posts a NOAN note
  * keyed to the window it covers and then emails the same report out. Those two
@@ -213,31 +202,20 @@ export async function cancelEmail(id) {
  * identify "the report for period P", so one re-run of period P produces one
  * note and one email.
  *
- * They drifted apart. The sends keyed on
- *   `<agent>-email:<period>:${GITHUB_RUN_ID || Date.now()}`
- * which is unique per run by construction, so a workflow_dispatch re-run of an
- * already-reported window re-emailed the Growth Team (flagged across #39, #40,
- * #41, #42 in the 2026-08-07 PR sweep).
+ * Never put a run id in the key: it makes every re-run of a reported window
+ * send again.
  *
- * The run-id wasn't arbitrary, though — it was a fix for a real 409 on
- * 2026-07-31, and dropping it naively would reintroduce that. Resend's contract
- * is that one key covers one payload: a repeat with the SAME payload replays the
- * original response, and a repeat with a DIFFERENT payload is rejected 409
- * `invalid_idempotent_request`. Our report bodies are built from live data and a
- * non-deterministic model call, so a re-run's payload is never byte-identical
- * and always lands in the 409 branch. sendEmail throws on non-2xx, so that 409
- * failed the whole workflow.
- *
- * That 409 is Resend telling us what we want to know — "this period already went
- * out" — so it's handled here as a successful skip rather than an error. Same
+ * Resend's contract is that one key covers one payload: a repeat with the SAME
+ * payload replays the original response, and a repeat with a DIFFERENT payload
+ * is rejected 409 `invalid_idempotent_request`. Report bodies come from live
+ * data and a model call, so a re-run's payload is never byte-identical and
+ * lands in the 409. That 409 means "this period already went out", so it is
+ * handled here as a successful skip rather than an error. Same
  * for `concurrent_idempotent_requests` (a concurrent run is mid-send for this
  * period): skipping is right, since retrying is what would duplicate.
  *
- * Limit worth knowing: Resend keeps idempotency keys for 24 hours. Within that
- * window this is a hard guarantee; a re-run of the same period days later WILL
- * re-send. That covers the failure this fixes (accidental or retried re-runs
- * near the scheduled time) and deliberately leaves the "re-run an old window on
- * purpose" case sending, which is usually what you want.
+ * Resend keeps idempotency keys for 24 hours. Within that window this is a
+ * hard guarantee; a re-run of the same period days later WILL re-send.
  *
  * To force a re-send inside the 24h window (e.g. the first report was wrong and
  * you want the corrected one to actually arrive), set REPORT_EMAIL_NONCE to any
@@ -278,7 +256,7 @@ function dedupeReason(err) {
  *
  * Deliberately does NOT accept `cc`: report sends go to a recipient list
  * resolved live from NOAN, and the fleet rule is no CC on
- * agent sends. Don't add it back — if a report needs another recipient, add
+ * agent sends. Don't add it: if a report needs another recipient, add
  * them to the tag the worker resolves.
  *
  * @param {string} agent   agent slug, e.g. "pr-sweep" — matches the note's externalId prefix
@@ -302,15 +280,14 @@ export async function sendReportEmail({ agent, period, to, subject, html, text, 
   }
 }
 
-/* ---------------- delivery stats (added 2026-07-26) ----------------
+/* ---------------- delivery stats ----------------
  * Resend reads status per email id, so we log every id this fleet sends and
  * the general agent's email_delivery tool reads it back and asks Resend for
  * each message's last_event.
  *
- * 2026-07-28: the log lives in the shared state backend (a "sent-log" row via
- * state-local.mjs), not a local jsonl — on GitHub runners the local disk is
- * destroyed after every run, which silently emptied the log after the Actions
- * migration. Missing row just means "no sends logged yet" (peekState), never
+ * The log lives in the shared state backend (a "sent-log" row via
+ * state-local.mjs), never on local disk: a GitHub runner's disk is destroyed
+ * after every run. A missing row means "no sends logged yet" (peekState), never
  * an abort: unlike agent ledgers, an empty send log can't cause a re-send.
  * Append is read-modify-write on one row, so two workers sending in the same
  * instant can drop an entry — acceptable for best-effort stats. */

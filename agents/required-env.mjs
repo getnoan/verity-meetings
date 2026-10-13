@@ -1,13 +1,9 @@
 /**
  * Configuration that must be supplied, never guessed.
  *
- * These helpers exist because the alternative — `process.env.X || "someone@example.com"`
- * — shipped our own addresses into the open-source agent pack, where they would
- * have routed a stranger's customer mail to our inboxes and put our teammates on
- * their agents' authorisation list. The export's secret scan caught it on
- * 2026-09-14, before publication.
- *
- * The rule now: an address or an authorisation list has NO default in code. The
+ * An address or an authorisation list has NO default in code. A fallback like
+ * `process.env.X || "someone@example.com"` would ship our addresses in the
+ * open-source agent pack and route a stranger's mail to our inboxes. The
  * fleet's own values live in agents/config.defaults.env, which is on the export's
  * FORBIDDEN list and can never ship. Downstream, an unset value fails loudly at
  * startup or fails closed — it never silently picks someone.
@@ -106,8 +102,7 @@ export function linkRule() {
 /** How prose refers to the agent. AGENT_PRONOUNS "she/her", "he/him" or
  *  anything else (they/them, the default and the neutral reading).
  *  `verb(base)` agrees a regular verb with the subject: "she picks", "they pick". Write every
- *  verb after `subj` through it; a hard-coded "picks" read "they picks it up" in every pack
- *  customer's escalations until 2026-10-02. */
+ *  verb after `subj` through it, or a hard-coded "picks" reads "they picks it up". */
 export function pronouns() {
   const v = (process.env.AGENT_PRONOUNS || "").trim().toLowerCase();
   const third = verb => `${verb}s`;

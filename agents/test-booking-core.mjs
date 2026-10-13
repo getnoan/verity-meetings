@@ -276,7 +276,7 @@ const tokenOf = url => url.split("/manage/")[1];
   const task = h.noan.db.tasks.get((await h.store.get(row.id)).noan_task_id);
   assert.equal(task.dueDate, TUE_1400);
   assert.match(task.title, /Tue 22 Sep 14:00$/);
-  // The reschedule is recorded as a COMMENT now, not appended to the brief.
+  // The reschedule is recorded as a COMMENT, not appended to the brief.
   assert.match((task.comments || []).map(c => c.content).join("\n"), /moved this meeting from Tue 22 Sep 2026, 09:00 \(Europe\/Lisbon\) to Tue 22 Sep 2026, 14:00/);
   assert.doesNotMatch(String(task.details || ""), /moved this meeting from/, "the task's own description is left alone");
   assert(h.noan.db.memos.some(x => x.title === `booking:${row.id}:reschedule:${TUE_1400}`));
@@ -373,9 +373,8 @@ const tokenOf = url => url.split("/manage/")[1];
   // withDeadline in core.mjs is a Promise.race: an item that gives no answer in
   // time leaves the NOAN write STILL RUNNING, so the task can land while the
   // remember() that records its id never does. The queue then retries against a
-  // row that still shows no task. On 2026-09-17 that filed two open tasks for
-  // the same guest, 41 seconds apart (booking:17ffd50e). The row's own
-  // noan_task_id cannot close that window; only reading the board can.
+  // row that still shows no task. The row's own noan_task_id cannot close that
+  // window; only reading the board can.
   const noan = fakeNoan();
   const real = createNoanCrm({ api: noan.api, verityId: VERITY, timeZone: avail.timeZone });
   let swallow = true;
@@ -425,8 +424,8 @@ const tokenOf = url => url.split("/manage/")[1];
 }
 
 {
-  // Live 2026-09-15: NOAN created the contact and never answered. A hang must become a
-  // recorded failure that frees the booking and lets the sweeper move on to the next one.
+  // NOAN can create the contact and never answer. A hang must become a recorded
+  // failure that frees the booking and lets the sweeper move on to the next one.
   const noan = fakeNoan();
   const real = createNoanCrm({ api: noan.api, verityId: VERITY, timeZone: avail.timeZone });
   let hang = true;
@@ -457,8 +456,8 @@ const tokenOf = url => url.split("/manage/")[1];
 
 /* ================= a held meeting closes its task ================= */
 {
-  // Nothing closed a held meeting's task: on 2026-10-02 twelve sat open on the board, five of
-  // them in duplicate pairs. The sweeper now queues a `held` item once the meeting has ended.
+  // The sweeper queues a `held` item once the meeting has ended, or the meeting's task stays
+  // open on the board.
   const at = clock;
   const h = harness();
   const b = await h.book(demo());
@@ -529,10 +528,9 @@ const tokenOf = url => url.split("/manage/")[1];
 
 /* ================= a slow attempt is waited for, not raced ================= */
 {
-  // Live 2026-09-24..29: five bookings with two open tasks each. The first book item ran past
-  // its deadline (attempts 1), kept running, and filed its task AFTER the sweeper's retry had
-  // searched the board and found nothing. Booking rows confirmed it: attempts 1, synced ~3.5
-  // minutes after creation. The retry now waits for the abandoned attempt first.
+  // A book item that runs past its deadline keeps running and can file its task AFTER the
+  // sweeper's retry has searched the board and found nothing. The retry waits for the
+  // abandoned attempt first, or the booking gets two open tasks.
   const noan = fakeNoan();
   const real = createNoanCrm({ api: noan.api, verityId: VERITY, timeZone: avail.timeZone });
   let first = true;
@@ -707,9 +705,8 @@ blocked dates: christmas
 
 /* ========= a contact lookup that never settled does not create, until late ========= */
 {
-  // Caroline Hoste, 2026-09-28: a booking's contact was a duplicate of a customer already on
-  // file. That one came from the retired Lovable app, but this path created on ANY unsettled
-  // miss too. Now the early attempts refuse; the sweeper retries; only a late attempt creates.
+  // Creating on an unsettled lookup can duplicate a customer already on file. Early attempts
+  // refuse, the sweeper retries, and only a late attempt creates.
   assert.ok(CREATE_ON_UNSETTLED_AFTER < MAX_ATTEMPTS, "must create before the booking parks for a human");
   const noan = fakeNoan();
   const seen = [];

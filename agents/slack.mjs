@@ -47,9 +47,9 @@ async function relayCall(method, args, { relay, retries = 3 }) {
 
 async function call(method, args = {}, { token, retries = 3, relay = relayConfig() } = {}) {
   if (relay && RELAY_METHODS.has(method)) {
-    // During the cutover a bot token may still be set: when the relay refuses
-    // (the hosted app is not in that channel yet, a cap, an outage) the call
-    // goes the old way and says so once, instead of losing the message.
+    // When a bot token is also set and the relay refuses (the hosted app is
+    // not in that channel yet, a cap, an outage), the call goes to Slack
+    // directly and says so once, instead of losing the message.
     try { return await relayCall(method, args, { relay, retries }); }
     catch (e) {
       if (!token) throw e;
@@ -60,7 +60,7 @@ async function call(method, args = {}, { token, retries = 3, relay = relayConfig
   // form-encoded, not JSON: Slack accepts application/x-www-form-urlencoded on
   // EVERY method, but application/json only on write methods (chat.postMessage
   // etc.) — read methods like users.info silently ignore a JSON body and then
-  // complain the arguments are missing. Learned live, 2026-07-25.
+  // complain the arguments are missing.
   const form = new URLSearchParams();
   for (const [k, v] of Object.entries(args)) {
     if (v !== undefined && v !== null) form.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
@@ -79,7 +79,7 @@ async function call(method, args = {}, { token, retries = 3, relay = relayConfig
       });
     } catch (e) {
       // connect timeouts / DNS blips reject the fetch itself and never reach
-      // the HTTP retry path below — cost a 2026-07-27 Actions run before this
+      // the HTTP retry path below, so retry them here
       if (attempt < retries) {
         await new Promise(r => setTimeout(r, 2000 * 2 ** attempt));
         continue;
@@ -109,7 +109,7 @@ export const slackApi = (method, args = {}) =>
 /* ---------------- @handle → <@ID> mention linking ----------------
  *
  * Slack only pings on <@U…> ids; a literal "@hope" renders as inert text, so
- * the model could never actually mention anyone. Both post functions now run
+ * the model could never actually mention anyone. Both post functions run
  * outgoing text through a directory lookup: an @word that matches a workspace
  * member's handle, display name, or real name becomes a real mention.
  *

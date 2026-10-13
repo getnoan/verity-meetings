@@ -129,9 +129,7 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
     // path. It is NOT enough after a timeout: withDeadline in core.mjs is a
     // Promise.race, so an item that gave no answer in time leaves this create
     // still running, and the remember() below may never land. The queue then
-    // retries against a row that still shows no task. That is how booking
-    // 17ffd50e ended up with two open tasks for the same guest, 41 seconds
-    // apart, on 2026-09-17.
+    // retries against a row that still shows no task and files a second one.
     //
     // So on a retry ONLY - attempts > 0 - look the externalId up first. The
     // scan pages the whole board (NOAN has no externalId filter: the query is
@@ -199,10 +197,9 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
       // CREATE_ON_UNSETTLED_AFTER does it create anyway, so a lookup that never settles still
       // files the contact before MAX_ATTEMPTS (5) parks the booking for a human.
       //
-      // This was `allowIncompleteSweep: true` on every attempt — "a rare duplicate beats a lost
-      // booking". But nothing is lost by waiting, and the duplicate is not rare in effect: it
-      // takes the booking memos, the meeting task and the booking row's contact id with it, all
-      // of which have to be moved by hand before it can be deleted (Caroline Hoste, 2026-09-28).
+      // Nothing is lost by waiting. A duplicate takes the booking memos, the meeting task and the
+      // booking row's contact id with it, and all of them have to be moved by hand before it can
+      // be deleted.
       const { contact } = await api.findOrCreateContactByEmail(row.guest_email, {
         name: row.guest_name,
         allowIncompleteSweep: (row.attempts || 0) >= CREATE_ON_UNSETTLED_AFTER,
@@ -260,7 +257,7 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
     ].filter(Boolean));
     if (!row.noan_task_id) return {};
     const route = type?.onCancel || { kind: "close" };
-    // The guest's own closing punctuation is dropped so the sentence ends once ("test.." read live).
+    // The guest's own closing punctuation is dropped so the sentence ends once.
     const reason = String(item.reason || "").replace(/[\s.!?]+$/, "");
     const note = `The guest cancelled this meeting${reason ? `. Their reason (unverified): ${reason}` : ""}.`;
     await api.postTaskComment(row.noan_task_id, note);
@@ -316,7 +313,7 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
 
   /* The open board, read once a minute at most. On deploy the sweeper queues every meeting that
    * ended in the lookback at once, and a board scan per booking would spend the API's rate
-   * limit (200 requests a minute; a drift check hit it on 2026-10-02). */
+   * limit (200 requests a minute). */
   let openBoard = null;
   async function openTask(id) {
     if (!openBoard || Date.now() - openBoard.at > 60_000) {
@@ -327,8 +324,7 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
   }
 
   /** The meeting has happened: the booking task has done its job of handing the call to the host.
-   *  Follow-ups from the call live on their own tasks (the Granola sync files them). Before this,
-   *  nothing closed a held meeting's task, and twelve sat open on 2026-10-02. */
+   *  Follow-ups from the call live on their own tasks (the Granola sync files them). */
   async function held(row, type) {
     if (row.status !== "confirmed" || !row.noan_task_id) return {};
     if (!hostOwned(type)) { log(`booking ${row.id}: held; task ${row.noan_task_id} belongs to an agent's route, left for it`); return {}; }

@@ -1,12 +1,9 @@
 /**
  * sender-registration.mjs: is the address an email came from the one on the sender's NOAN record?
  *
- * The reply worker answers whoever writes. When a known customer writes from a second address
- * (a personal gmail beside the work address they signed up with), nothing used to notice:
- * the address was not a contact, so a fresh untagged contact was created and the customer was
- * treated as a stranger. In one live case the customer also asked for the email course from the
- * second address, was routed to the support reply instead, and was told "you're enrolled" when
- * nothing had been set up.
+ * The reply worker answers whoever writes. A known customer can write from a second address
+ * (a personal gmail beside the work address they signed up with) that is not a contact; without
+ * these checks they get a fresh untagged contact and are treated as a stranger.
  *
  * Three decisions live here, all pure except the one database read:
  *

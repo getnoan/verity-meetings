@@ -6,13 +6,9 @@
  * `grep -Ev '^\s*(#|$)' agents/config.defaults.env >> "$GITHUB_ENV"`), so every
  * Actions worker has VERITY_IDENTITY_IDS, HUMAN_IDENTITIES, PARK_ASSIGNEES_* and
  * the rest. The Render services do not (render.yaml lists only the secrets and a
- * handful of service knobs), so the same worker started by
- * a Render service saw NONE of them: parkForHuman resolved no human
- * ("NO HUMAN RESOLVED … set PARK_ASSIGNEES_ENG"), verityIds() was empty, and a
- * park from Render would have been handed to nobody. Found 2026-09-11 while
- * giving a Render-hosted claim an owner. The file ships in the image (the
- * service's Dockerfile copies agents/), so reading it from disk is the one
- * answer that works in both. A checkout without the file loads nothing.
+ * handful of service knobs); without this, parkForHuman resolves no human and
+ * verityIds() is empty there. The file ships in the image (the service's
+ * Dockerfile copies agents/), so reading it from disk works in both. A checkout without the file loads nothing.
  *
  * Secrets never live in that file, and an already-set value always wins, so
  * calling this in Actions is a no-op and calling it on Render fills the gaps.

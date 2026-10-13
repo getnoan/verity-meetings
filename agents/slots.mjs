@@ -18,8 +18,8 @@ const HHMM_RX = /^([01]\d|2[0-3]):([0-5]\d)$|^24:00$/;
 
 /** UTC Date for wall-clock y-m(0-based)-d hh:mm in an IANA timezone (DST-aware).
  *  Reads the offset via formatToParts so the result never depends on the
- *  machine's own TZ (the old toLocaleString round-trip parsed in machine-local
- *  time and ran an hour late on runners whose TZ observed DST). */
+ *  machine's own TZ. Never round-trip through toLocaleString: it parses in
+ *  machine-local time and runs an hour late on runners whose TZ observes DST. */
 export function zonedToUtc(y, m, d, hh, mm, tz) {
   const guess = Date.UTC(y, m, d, hh, mm);
   const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
@@ -92,8 +92,7 @@ export const SCHEDULE_DEFAULTS = Object.freeze({
 /**
  * The Scheduling Agent Config fact → the availability config both lanes use.
  * Lenient on purpose (unknown keys ignored, missing keys default) — the fact is
- * edited by hand in the NOAN UI. The original keys parse exactly as
- * reply-worker.mjs always parsed them; two are new and optional:
+ * edited by hand in the NOAN UI. Two keys are optional:
  *
  *   hours Fri: 09:00-13:00          per-weekday hours (several windows with ",", or "off")
  *   blocked dates: 2026-12-24, 2026-12-25
@@ -135,9 +134,8 @@ export function hoursFor(avail, type, dateISO) {
   const host = avail.weekHours?.[day] ?? [];
   const own = type?.weekHours?.[day];
   // A type's own `hours` lines ARE its host's week for that day (an empty list closes it);
-  // the fact's week is the fallback. They used to be clipped to the fact's hours, which was
-  // right while one person owned both: since booking pages have more than one host
-  // (2026-09-16), the fact's week belongs to whoever owns the fact, and one person's
+  // the fact's week is the fallback. Never clip them to the fact's hours: booking pages have
+  // more than one host, the fact's week belongs to whoever owns the fact, and one person's
   // working day must not cap another's.
   return own || host;
 }

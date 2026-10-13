@@ -49,9 +49,8 @@ export const PRICING = {
   },
   // ~Creator tier $/char at list. An install on a grant or a flat plan sets
   // ELEVENLABS_USD_PER_CHAR (0 for a grant) and the ledger keeps the
-  // characters (units) without inventing dollars; a list-price estimate on
-  // a free plan once made up most of a voice surface's "spend" and tripped
-  // its daily budget shutoff (2026-09-24).
+  // characters (units) without inventing dollars. A list-price estimate on
+  // a free plan would trip a voice surface's daily budget shutoff.
   elevenlabs: { perUnit: process.env.ELEVENLABS_USD_PER_CHAR !== undefined ? parseFloat(process.env.ELEVENLABS_USD_PER_CHAR) || 0 : 0.00022 },
   firecrawl:  { perUnit: 0.001 },    // ~1 credit per scrape/search
   resend:     { perUnit: 0.0004 },   // flat plan amortized; pure estimate
@@ -70,8 +69,7 @@ export const PRICING = {
  *  PRICING is keyed by alias (`claude-haiku-4-5`), but callers log whatever id
  *  they passed to the API, and a dated snapshot id is equally valid there —
  *  `claude-haiku-4-5-20251001` is the same model at the same price. Exact
- *  lookup missed it, so 449 of the 650 Haiku rows since 2026-07-01 priced at
- *  $0 and silently undercounted every total that included them. Strip a
+ *  lookup misses it and silently prices the row at $0. Strip a
  *  trailing -YYYYMMDD and retry: no current alias ends in an 8-digit date, so
  *  this can only ever turn a miss into the right rate. An id that is genuinely
  *  absent still returns undefined and is reported by the unpriced warning. */
@@ -188,8 +186,7 @@ export async function recordUsage({ agent, action, provider, model, usage, units
  *  frozen at write time; a metered provider whose rate is set by env
  *  (ELEVENLABS_USD_PER_CHAR: 0 on a grant) is re-priced from its units, so a
  *  daily budget never locks a surface over an estimate the rate has since
- *  corrected (2026-09-24: a day of list-priced renders kept a surface shut
- *  after the rate went to zero). Everything else keeps its stored cost. */
+ *  corrected. Everything else keeps its stored cost. */
 export function rowCost(row) {
   if (row?.provider === "elevenlabs" && row.units != null) return (parseFloat(row.units) || 0) * PRICING.elevenlabs.perUnit;
   return parseFloat(row?.cost_usd) || 0;

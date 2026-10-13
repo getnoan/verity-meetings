@@ -8,7 +8,7 @@
  * it would overlap a confirmed booking (23P01) or reuse a token (23505)
  * surfaces as StoreConflict, which the core turns into "that time was just
  * taken". PostgREST reports an exclusion violation as a 400 and a unique
- * violation as a 409 (seen live on 2026-09-15), so the code decides, not the status.
+ * violation as a 409, so the code decides, not the status.
  */
 import { StoreConflict } from "./store-errors.mjs";
 

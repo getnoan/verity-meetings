@@ -21,8 +21,13 @@ is just swapping the fakes for real services.
 
 The service's brain is two facts in your NOAN workspace (https://app.getnoan.com):
 your availability (Scheduling Config) and your meeting types (Booking Types). Create a
-workspace if you don't have one, then create an API key (Settings → API keys). Give the
-key to your agent as `NOAN_AGENT_API_KEY` in the deploy env — never commit it.
+workspace if you don't have one, then give the service a key of its own: create the agent
+under Settings → Team, then its key under Settings → API → Agent API Keys. Give the key to
+your agent as `NOAN_AGENT_API_KEY` in the deploy env — never commit it.
+
+Everything the service writes (contacts, booking tasks) is then the agent's. A person's key
+works too, but those writes are attributed to that person. Set `NOAN_EXPECT_BOT=1` and the
+service refuses every NOAN call made with any other key.
 
 Then let the agent seed the two facts and capture their block slugs:
 
@@ -107,4 +112,4 @@ Calendly on your own domain, with availability and meeting types living in your 
 layer instead of a SaaS dashboard, reschedule/cancel links in every confirmation, and
 bookings landing as tasks in your workspace.
 
-Exported from getnoan/agents @ 28eba76e.
+Exported from getnoan/agents @ a30bfc0a.

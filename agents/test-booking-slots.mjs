@@ -1,7 +1,7 @@
 /**
  * slots.mjs (NOAN-MEETINGS-PLAN §6) — pure tests, pinned clock, no network.
- * Also proves the email lane still reads the Scheduling Agent Config the way
- * it always did, now through the shared parser.
+ * Also proves the email lane reads the Scheduling Agent Config through the
+ * shared parser.
  */
 import assert from "node:assert";
 import { parseScheduleFact, daySlots, monthDays, isOfferedSlot, rangeFor, hoursFor, weekdayOf } from "./slots.mjs";

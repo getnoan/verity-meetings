@@ -332,7 +332,8 @@ async function main() {
 
       findEventByBooking: (id, host) => g.findEventByPrivate("bookingId", id, host),
     };
-    crm = createNoanCrm({ timeZone: cfg.avail.timeZone, publicUrl: env.BOOKING_PUBLIC_URL, dispatch: githubDispatch(env) });
+    const profiler = null;
+    crm = createNoanCrm({ timeZone: cfg.avail.timeZone, publicUrl: env.BOOKING_PUBLIC_URL, dispatch: githubDispatch(env), profiler });
   }
   const store = env.BOOKING_STORE === "memory"
     ? (console.warn("booking: IN-MEMORY store: bookings are lost on restart. Local runs only."), createMemoryStore())

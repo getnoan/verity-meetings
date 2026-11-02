@@ -14,7 +14,7 @@ import { noanGetAll, noanPost } from "./noan.mjs";
 export const FACT = `Meeting scheduling rules. Edit values; keep the "key: value" format.
 
 timezone: Europe/Lisbon
-working hours: 09:00-17:30
+working hours: 09:00-21:30
 meeting length minutes: 30
 buffer minutes: 15
 lookahead days: 10

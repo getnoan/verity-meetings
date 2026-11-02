@@ -343,6 +343,35 @@ export function readSendLog(days = 7) {
   } catch { return []; }
 }
 
+/** Every email sent since `sinceMs`, newest first, as { id, to, created_at, last_event }.
+ *  GET /emails pages newest-first and is rate limited to ~2 req/s, hence the pause. Never
+ *  throws: `error` says why the walk stopped early, with whatever was read before it. */
+export async function listRecentEmails(sinceMs, { maxPages = 100, pause = 550, fetchImpl = fetch } = {}) {
+  const emails = [];
+  let after = "", pages = 0;
+  try {
+    const { key } = mailEnv({ needFrom: false });
+    for (; pages < maxPages; pages++) {
+      if (pages) await new Promise(r => setTimeout(r, pause));
+      const res = await fetchImpl(`${RESEND_URL}?limit=100${after ? `&after=${after}` : ""}`,
+        { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(15_000) });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(`Resend ${res.status}: ${j?.message || "unknown"}`);
+      const items = j.data || [];
+      emails.push(...items.map(e => ({ id: e.id, to: e.to || [], created_at: e.created_at, last_event: e.last_event })));
+      const last = items[items.length - 1];
+      if (!j.has_more || !last || resendTime(last.created_at) < sinceMs) return { emails, pages: pages + 1, error: null };
+      after = last.id;
+    }
+    return { emails, pages, error: `stopped after ${maxPages} pages, older sends not read` };
+  } catch (e) {
+    return { emails, pages, error: String(e.message || e).slice(0, 160) };
+  }
+}
+
+/** Resend's created_at ("2026-10-19 10:00:00.123+00") as epoch ms; Date.parse alone gives NaN. */
+export const resendTime = s => Date.parse(String(s || "").replace(" ", "T").replace(/([+-]\d\d)$/, "$1:00"));
+
 /** One email's delivery state from Resend: last_event etc. */
 export async function fetchEmailStatus(id) {
   const { key: KEY } = mailEnv({ needFrom: false });

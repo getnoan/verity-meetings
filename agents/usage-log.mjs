@@ -119,9 +119,14 @@ function entryAgent() {
  * (the Slack app: tenants, sessions, drafts) names the ledger separately with
  * USAGE_SUPABASE_URL / USAGE_SUPABASE_SERVICE_ROLE_KEY. Until 2026-10-13 the Slack
  * app wrote its rows to its own project, which has no api_usage table, so every
- * model call it made was invisible to the spend report (usage-log fails soft). */
+ * model call it made was invisible to the spend report (usage-log fails soft).
+ * The pair is taken whole: half of it set must never send one project's service
+ * key to another project's URL. */
 export function ledgerTarget(env = process.env) {
-  return { base: (env.USAGE_SUPABASE_URL || env.SUPABASE_URL || "").replace(/\/$/, ""), key: env.USAGE_SUPABASE_SERVICE_ROLE_KEY || env.SUPABASE_SERVICE_ROLE_KEY || "" };
+  const own = env.USAGE_SUPABASE_URL && env.USAGE_SUPABASE_SERVICE_ROLE_KEY;
+  const url = own ? env.USAGE_SUPABASE_URL : env.SUPABASE_URL;
+  const key = own ? env.USAGE_SUPABASE_SERVICE_ROLE_KEY : env.SUPABASE_SERVICE_ROLE_KEY;
+  return { base: (url || "").replace(/\/$/, ""), key: key || "" };
 }
 
 let ctx = {};

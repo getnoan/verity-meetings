@@ -112,4 +112,4 @@ Calendly on your own domain, with availability and meeting types living in your 
 layer instead of a SaaS dashboard, reschedule/cancel links in every confirmation, and
 bookings landing as tasks in your workspace.
 
-Exported from getnoan/agents @ a30bfc0a.
+Exported from getnoan/agents @ feb822c.

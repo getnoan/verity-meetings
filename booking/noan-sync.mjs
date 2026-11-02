@@ -5,8 +5,11 @@
  *
  *   book        find-or-create the contact, fill EMPTY fields from answers,
  *               merge the type's contact tags, `booking:<id>:book` memo, the task
- *   reschedule  memo, then the task's due date and title move with a note
- *   cancel      memo, then the type's `on cancel:` route (close, keep, hand to a trigger tag)
+ *               (tagged Meeting, so a Space's Meetings in the App Kit lists it),
+ *               then, when a profiler is passed, hands it the guest's contact
+ *   reschedule  memo, then the task's due date, title and When line move with a note
+ *   cancel      memo, the Meeting tag off the task (a cancelled call is no meeting),
+ *               then the type's `on cancel:` route (close, keep, hand to a trigger tag)
  *   brief       the guest ticked "brief me before the call": a task for the Pre-call Brief
  *               agent, then a dispatch so it runs now, not at the next poll
  *   held        the meeting has ended (the sweeper queues this): close the host's task, unless
@@ -30,12 +33,37 @@ const UNTRUSTED = "Guest answers (written by the guest, unverified):";
 const DETAILS_MAX = 2000;
 
 export const BRIEF_TAG = "Pre-call Brief";
+/** The tag every booking's task carries, so the App Kit's Meetings reads it as a meeting:
+ *  its due date the day it is held, its contact the guest, its "When:" line the time. Found by name and never made here:
+ *  a person (or the App Kit's Add a meeting) makes it once. */
+export const MEETING_TAG = "Meeting";
+/** The most a Meeting step (the tag, the When line) may take before it is given up on, well inside core.mjs's per-item
+ *  deadline: it is bookkeeping for the App Kit and never worth a booking's retry. */
+const BEST_EFFORT_MS = 20_000;
+const soon = (promise, ms) => {
+  let timer;
+  return Promise.race([promise, new Promise((_, no) => { timer = setTimeout(() => no(new Error(`no answer in ${ms / 1000}s`)), ms); })])
+    .finally(() => clearTimeout(timer));
+};
+const withoutMeeting = tags => (tags || []).filter(t => String(t?.name || "").toLowerCase() !== MEETING_TAG.toLowerCase());
+
+/** A task's details with the head's `When:` line (above the guest's answers, which nothing here routes on) set to
+ *  `said`, or null where there is none, nothing changes, or the result would not fit the API's cap. */
+export function movedWhen(details, said) {
+  if (typeof details !== "string") return null;
+  const cut = details.indexOf(UNTRUSTED);
+  const head = cut >= 0 ? details.slice(0, cut) : details;
+  if (!/^When: .*$/m.test(head)) return null;
+  const line = `When: ${String(said).replace(/[\r\n]+/g, " ")}`;
+  const next = head.replace(/^When: .*$/m, () => line) + (cut >= 0 ? details.slice(cut) : "");
+  return next !== details && next.length <= DETAILS_MAX ? next : null;
+}
 
 /** From this attempt on, book() creates the guest's contact even when the lookup never settled.
  *  Must stay below core.mjs MAX_ATTEMPTS, or a booking parks for a human over a lookup. */
 export const CREATE_ON_UNSETTLED_AFTER = 3;
 
-export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZone = "Europe/Lisbon", publicUrl = "", log = console.log, dispatch = async () => false } = {}) {
+export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZone = "Europe/Lisbon", publicUrl = "", log = console.log, dispatch = async () => false, profiler = null } = {}) {
   const tz = () => timeZone;
 
   // Fixed English names: Intl's short month varies by ICU build ("Sep" vs "Sept"),
@@ -158,7 +186,17 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
     // Fresh task: the contact set is empty, so the PUT loses nothing.
     await api.noanPut(`/tasks/${taskId}/contacts`, { contactIds: [contactId] });
     const withVerity = route.kind === "tag" || (route.kind === "owner" && route.who === "verity");
-    if (route.kind === "tag") await api.addTaskTags({ id: taskId, tags: [] }, route.tag);
+    // Fresh task: its tag set is empty, so one PUT carries the route's trigger tag and Meeting together. Meeting is
+    // best effort: a lookup that fails must never stop the owner being put on the task below, since a retry finds
+    // noan_task_id set and never comes back here.
+    const meetingId = await soon(api.findTagId(MEETING_TAG), BEST_EFFORT_MS)
+      .catch(e => { log(`booking ${row.id}: Meeting tag not looked up (${e.message}); task ${taskId} left without it`); return null; });
+    const fresh = { id: taskId, tags: meetingId ? [{ id: meetingId, name: MEETING_TAG }] : [] };
+    if (route.kind === "tag") await api.addTaskTags(fresh, route.tag);
+    else if (meetingId) {
+      await soon(api.noanPut(`/tasks/${taskId}/tags`, { tagIds: [meetingId] }), BEST_EFFORT_MS)
+        .catch(e => log(`booking ${row.id}: task ${taskId} not tagged Meeting (${e.message})`));
+    }
     // The host is always on it; the agent too when it is meant to pick it up.
     await api.assignResolvedOwner(taskId, {
       requesterEmail: row.host_email, lane: "sales", agent: "booking",
@@ -231,6 +269,7 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
     if (!row.noan_task_id && (type?.onBook?.kind || "owner") !== "none") {
       await createTask(type, row, contactId, remember, twin);
     }
+    profiler?.profile(row, contactId, c);
     return {};
   }
 
@@ -242,7 +281,13 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
       `From: ${when(item.from)}`, `To: ${when(item.to)}`,
     ]);
     if (row.noan_task_id) {
-      await api.noanPatch(`/tasks/${row.noan_task_id}`, { dueDate: row.start_at, title: taskTitle(type, row) });
+      // The details' When line moves with the day, or the App Kit would read a time for another day (and shows none).
+      // Best effort, and only the head's line: nothing else in the details is touched, and a rewrite that would not fit
+      // is left out rather than cut.
+      const task = await soon(api.findTaskById(row.noan_task_id), BEST_EFFORT_MS)
+        .catch(e => { log(`booking ${row.id}: When line not moved (${e.message})`); return null; });
+      const details = movedWhen(task?.details, when(row.start_at, row.end_at));
+      await api.noanPatch(`/tasks/${row.noan_task_id}`, { dueDate: row.start_at, title: taskTitle(type, row), ...(details ? { details } : {}) });
       await api.postTaskComment(row.noan_task_id, `The guest moved this meeting from ${when(item.from)} to ${when(item.to)}.`);
     }
     return {};
@@ -261,15 +306,28 @@ export function createNoanCrm({ api = live, verityId = agentIdentityId(), timeZo
     const reason = String(item.reason || "").replace(/[\s.!?]+$/, "");
     const note = `The guest cancelled this meeting${reason ? `. Their reason (unverified): ${reason}` : ""}.`;
     await api.postTaskComment(row.noan_task_id, note);
-    if (route.kind === "close") {
-      await api.noanPatch(`/tasks/${row.noan_task_id}`, { status: "done", completed: true });
-    } else if (route.kind === "tag") {
-      // Hand it on: the trigger tag plus the agent's identity, so it picks it up on its next poll.
+    // A cancelled call is no meeting: the Meeting tag comes off, so the App Kit never lists it as one held.
+    if (route.kind === "tag") {
+      // Hand it on: the trigger tag plus the agent's identity, so it picks it up on its next poll. The task's own tags
+      // are read and merged (a PUT replaces the set), Meeting left out.
       const task = await api.findTaskById(row.noan_task_id);
       if (task) {
-        await api.addTaskTags(task, route.tag);
+        await api.addTaskTags({ ...task, tags: withoutMeeting(task.tags) }, route.tag);
         await api.assignVerity(task);
       }
+      return {};
+    }
+    // Every other route: best effort, before the close so the task is still on the open board, and never in the way of it.
+    try {
+      const task = await soon(api.findTaskById(row.noan_task_id), BEST_EFFORT_MS);
+      const kept = withoutMeeting(task?.tags);
+      // A PUT replaces the set, so it goes only when every tag kept carries its id.
+      if (task && kept.length !== (task.tags || []).length && kept.every(t => t?.id)) {
+        await soon(api.noanPut(`/tasks/${task.id}/tags`, { tagIds: kept.map(t => t.id) }), BEST_EFFORT_MS);
+      }
+    } catch (e) { log(`booking ${row.id}: Meeting tag not taken off task ${row.noan_task_id} (${e.message})`); }
+    if (route.kind === "close") {
+      await api.noanPatch(`/tasks/${row.noan_task_id}`, { status: "done", completed: true });
     }
     return {};
   }

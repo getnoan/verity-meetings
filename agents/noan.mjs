@@ -534,6 +534,24 @@ export function isAgentIdentity({ id = null, role = null } = {}) {
   return !!id && agentIdentityIds().includes(id);
 }
 
+/** Creating stacks and blocks is a ROLE permission in NOAN (fact.update.stacks), held
+ *  only by owner and executive. The agent (role bot) and every other role get
+ *  403 MissingPermission on POST /stacks and POST /stacks/{id}/blocks whatever the
+ *  key's scopes, so say that rather than echo the 403. A 403 with another code
+ *  (ResourceNotAllowed: a managed stack) is a different refusal. Reads both error
+ *  shapes: this module's e.noan and a plain client's e.status + e.body. */
+export function isStructureRoleRefusal(e) {
+  const status = e?.noan?.status ?? e?.status ?? null;
+  const code = e?.noan?.code ?? e?.body?.code ?? null;
+  return status === 403 && (code == null || code === "MissingPermission");
+}
+
+/** What to tell the person when isStructureRoleRefusal(e). `what` names the
+ *  stack or block, e.g. `the "Brand" stack`. */
+export function structureRoleMessage(what) {
+  return `NOAN refused to create ${what}: only a person with the owner or executive role can create stacks and blocks, whatever the key's settings. Ask one to create it in the NOAN app, then try again.`;
+}
+
 /** Who the key belongs to, for code that acts on GET /me's identity.
  *
  *  `human` is the identity only when it is a person, so work is never handed
@@ -1050,6 +1068,16 @@ export function humanIdentityFor(email, env = process.env) {
   return id;
 }
 
+/** The reverse: a known human's email for a workspace identity id, or null. Only
+ *  people HUMAN_IDENTITIES names resolve, so an unknown id never becomes an address,
+ *  and the agent's own ids never do either. */
+export function humanEmailForIdentity(id, env = process.env) {
+  const want = String(id || "").trim();
+  if (!want || verityIds().includes(want)) return null;
+  for (const [email, hid] of humanIdentities(env)) if (hid === want) return email;
+  return null;
+}
+
 /** The requester a task names in its own details: a `Notify:` line wins,
  *  then `Requested by <email>`. Null when neither is there — callers that
  *  need a fallback add their own (the general agent's GENERAL_NOTIFY is for the
@@ -1356,6 +1384,20 @@ async function contactSnapshot({ rounds = 1 } = {}) {
   };
 }
 
+/** The contacts with exactly this address, from the API's own filter, or null when the filter
+ *  cannot be trusted. GET /contacts?email= matches server side and case-insensitively in one
+ *  request, and the server refuses a second contact on an address it already holds, so its
+ *  answer, hit or miss, is the authoritative one. null means fall back to the sweep: the request
+ *  failed (a list endpoint 400s on a parameter it does not know), the body had no items (an
+ *  error shape such as Unauthenticated or RateLimitExceeded), or a row came back with another
+ *  address, which means the filter was ignored and a miss here would be a false absence. */
+async function contactsByEmailFilter(needle) {
+  const r = await noanGet(`/contacts?email=${encodeURIComponent(needle)}&per_page=5`).catch(() => null);
+  if (!Array.isArray(r?.items)) return null;
+  if (r.items.some(c => (c?.email || "").toLowerCase() !== needle)) return null;
+  return r.items;
+}
+
 /** Look an address up AND say how much to trust the answer.
  *
  *  `{ contact, complete, seen, reportedTotal, unreadable }`. A hit is always `complete: true` —
@@ -1366,13 +1408,19 @@ async function contactSnapshot({ rounds = 1 } = {}) {
  *  It is deliberately NOT "we saw every row meta.totalItems claims": the list endpoint drops rows
  *  inside large tie groups, so that test never passes and every miss would stay untrusted.
  *
- *  The miss path is expensive on purpose: an established contact can be absent from several
- *  consecutive union sweeps, and there is no DELETE /contacts, so a duplicate is permanent. Any
- *  ids in NOAN_UNREACHABLE_CONTACT_IDS are read directly before a create. */
+ *  The API's exact email filter answers first, in one request (contactsByEmailFilter). The sweep
+ *  below runs only when that filter cannot be trusted, and its miss path is expensive on purpose:
+ *  an established contact can be absent from several consecutive union sweeps, and there is no
+ *  DELETE /contacts, so a duplicate is permanent. Any ids in NOAN_UNREACHABLE_CONTACT_IDS are read
+ *  directly before a create. The sweep took 33 s for a new address at about 1,160 contacts, past
+ *  what a website visitor's request survives. */
 export async function lookupContactByEmail(email) {
   const needle = String(email ?? "").trim().toLowerCase();
   if (!needle) return { contact: null, complete: true, seen: 0, reportedTotal: 0, unreadable: 0 };
   const match = list => list.find(c => (c.email || "").toLowerCase() === needle) || null;
+
+  const filtered = await contactsByEmailFilter(needle);
+  if (filtered) return { contact: match(filtered), complete: true, seen: null, reportedTotal: null, unreadable: 0 };
 
   // `q=` never matches an address on this API, but it is one cheap request and it does hit when
   // the local part or domain happens to appear in a name, alias or website. Kept as a fast path.
@@ -1404,6 +1452,8 @@ export async function lookupContactByEmail(email) {
  *  must not pay for it twice. One round, deliberately: this serves the agent-facing contact
  *  SEARCH, where a miss is shown to a human who can look again, not used to decide a write. */
 async function fullListByEmail(needle) {
+  const filtered = await contactsByEmailFilter(needle);
+  if (filtered) return filtered[0] || null;
   const { list } = await contactSnapshot();
   return list.find(c => (c.email || "").toLowerCase() === needle) || null;
 }
@@ -1428,13 +1478,33 @@ function rememberContact(contact) {
   _contactsByEmailCache.list.push(contact);
 }
 
+/** One contact by id: the full record, memos and tags included, or null if no such contact.
+ *
+ *  Use this whenever you hold an id. `GET /contacts?q=<id>` never matches (q searches name,
+ *  alias and website), and scanning one list page misses every contact past the first 100,
+ *  which is most of them. The follow-up worker did both until 2026-10-30, so a task carrying
+ *  a valid Contact ID fell back to a bare email and the reach check refused it.
+ *
+ *  The response nests under `contact`. A 404 is null; anything else throws, so an outage
+ *  is not mistaken for a missing contact. */
+export async function getContactById(id) {
+  if (!id) return null;
+  try {
+    const res = await noanGet(`/contacts/${encodeURIComponent(id)}`);
+    const contact = res?.contact || res;
+    return contact?.id ? contact : null;
+  } catch (e) {
+    if (e?.noan?.status === 404) return null;
+    throw e;
+  }
+}
+
 /** Create a contact, and treat the API's duplicate refusal as a find.
  *
- *  THE API DOES NOT DEDUPE CONTACTS: POST /contacts does not check the email and
- *  does not answer 409 on an address that already exists. The 409 branch below is
- *  DEFENSIVE AND CURRENTLY DEAD. Do not reason from it: the lossy lookup above is
- *  the ONLY check, and a miss it gets wrong is a permanent duplicate, because there
- *  is no DELETE for contacts.
+ *  The API refuses a contact whose email is already on file (409, ResourceAlreadyExists,
+ *  naming the existing contact), on create and on update. The branch below turns that
+ *  refusal into a find. Look the address up first anyway (findOrCreateContactByEmail):
+ *  a contact with no email, or a deployment without that check, has only the lookup.
  *
  *  Use this for EVERY create, never a bare `noanPost("/contacts", ...)`.
  *  test-generic-config.mjs fails CI on the raw call in the shipped closure, and
@@ -1505,8 +1575,9 @@ export async function findOrCreateContactByEmail(email, { name, website, tagIds,
   if (website) body.website = website;
   if (tagIds?.length) body.tagIds = tagIds;
 
-  // Nothing behind this: the sweep above IS the dedupe, because the server does
-  // not check (see createContact). A wrong answer above is a permanent duplicate.
+  // The server refuses an address it already holds, and createContact turns that 409 into a
+  // find. The lookup above still decides first: a wrong answer there is a permanent duplicate
+  // wherever that check is missing.
   return createContact(body);
 }
 

@@ -12,14 +12,15 @@ const ok = (name) => console.log("  ok  ", name);
 const lisbon = (iso) => new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Europe/Lisbon" }).format(new Date(iso));
 
 /* ---------- the shared parser reads the live fact's grammar unchanged ---------- */
-const avail = parseScheduleFact(SCHEDULE_FACT);
-const { weekHours, blockedDates, ...legacy } = avail;
+const seedAvail = parseScheduleFact(SCHEDULE_FACT);
+const SEED_END = /^working hours: \d\d:\d\d-(\d\d:\d\d)$/m.exec(SCHEDULE_FACT)[1];
+const { weekHours, blockedDates, ...legacy } = seedAvail;
 assert.deepEqual(legacy, {
-  timeZone: "Europe/Lisbon", workStart: "09:00", workEnd: "17:30", durationMin: 30, bufferMin: 15,
+  timeZone: "Europe/Lisbon", workStart: "09:00", workEnd: SEED_END, durationMin: 30, bufferMin: 15,
   lookaheadDays: 10, minNoticeHours: 24, maxSlots: 3, maxRounds: 2, meet: true,
 });
 ok("seed Scheduling Agent Config parses to the values reply-worker always used");
-assert.deepEqual(weekHours.Mon, [["09:00", "17:30"]]);
+assert.deepEqual(weekHours.Mon, [["09:00", SEED_END]]);
 assert.deepEqual(weekHours.Sat, []);
 assert.equal(blockedDates.size, 0);
 ok("working hours fill Mon–Fri; weekends off; no blocked dates by default");
@@ -33,11 +34,16 @@ blocked dates: 2026-09-24, 2026-02-30, nonsense`);
 assert.deepEqual(custom.weekHours.Fri, [["09:00", "13:00"]]);
 assert.deepEqual(custom.weekHours.Wed, []);
 assert.deepEqual(custom.weekHours.Sat, [["10:00", "12:00"], ["14:00", "15:00"]]);
-assert.deepEqual(custom.weekHours.Tue, [["09:00", "17:30"]], "a malformed line leaves the day on working hours");
+assert.deepEqual(custom.weekHours.Tue, [["09:00", SEED_END]], "a malformed line leaves the day on working hours");
 assert.deepEqual([...custom.blockedDates], ["2026-09-24"], "impossible and junk dates are dropped");
 ok("per-weekday hours, several windows, off days, blocked dates; malformed input degrades safely");
 
 /* ---------- daySlots: the booking page grid ---------- */
+// The grid arithmetic below is pinned to a 09:00-17:30 day rather than whatever the
+// seed's working hours are today: those are a business setting, and a change to them
+// must not move every slot count in this file.
+const avail = parseScheduleFact(SCHEDULE_FACT.replace(/^working hours: .*$/m, "working hours: 09:00-17:30"));
+assert.deepEqual(avail.weekHours.Tue, [["09:00", "17:30"]], "the pinned grid day took");
 const DEMO = { lengthMin: 30, stepMin: 30, minNoticeHours: 12, maxDaysOut: 30 };
 const EARLY = new Date("2026-09-14T08:00:00Z");           // Mon, well before the dates below
 const TUE = "2026-09-22";                                  // Lisbon is UTC+1 in September

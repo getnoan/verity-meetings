@@ -8,7 +8,7 @@ import assert from "node:assert";
 import { createBookingCore, hashToken, MAX_ATTEMPTS } from "../booking/core.mjs";
 import { createFakeCalendar } from "../booking/fake-calendar.mjs";
 import { createMemoryStore } from "../booking/store-memory.mjs";
-import { createNoanCrm, CREATE_ON_UNSETTLED_AFTER } from "../booking/noan-sync.mjs";
+import { createNoanCrm, CREATE_ON_UNSETTLED_AFTER, movedWhen } from "../booking/noan-sync.mjs";
 import { ics } from "../booking/alerts.mjs";
 import { parseScheduleFact } from "./slots.mjs";
 import { parseBookingTypes } from "./booking-types.mjs";
@@ -64,7 +64,7 @@ assert.deepEqual(TYPES.errors, []);
 /* ---------------- fake NOAN ---------------- */
 function fakeNoan() {
   const db = { contacts: new Map(), tasks: new Map(), memos: [] };
-  const tagIds = { lead: "tag-lead", "demo booked": "tag-demo", deck: "tag-deck", reengage: "tag-reengage", "pre-call brief": "tag-brief" };
+  const tagIds = { lead: "tag-lead", "demo booked": "tag-demo", deck: "tag-deck", reengage: "tag-reengage", "pre-call brief": "tag-brief", meeting: "tag-meeting" };
   let n = 0;
   const api = {
     sanitizeCopy,
@@ -103,6 +103,8 @@ function fakeNoan() {
       return [...db.tasks.values()].find(t => t.externalId === externalId) || null;
     },
     async noanPut(path, body) {
+      const t = /^\/tasks\/(\w+)\/tags$/.exec(path);
+      if (t) { const names = Object.fromEntries(Object.entries(tagIds).map(([k, v]) => [v, k])); db.tasks.get(t[1]).tags = body.tagIds.map(id => ({ id, name: (db.tasks.get(t[1]).tags.find(x => x.id === id) || {}).name || names[id] })); return {}; }
       const m = /^\/tasks\/(\w+)\/contacts$/.exec(path);
       if (!m) throw new Error(`fake noanPut ${path}`);
       db.tasks.get(m[1]).contacts = body.contactIds.map(id => ({ id }));
@@ -110,7 +112,8 @@ function fakeNoan() {
     },
     async addContactMemo(id, content, title) { db.memos.push({ id, content, title }); db.contacts.get(id).memos.push({ title, content }); },
     async findTagId(name) { return tagIds[name.toLowerCase()] || null; },
-    async addTaskTags(task, ...names) { const t = db.tasks.get(task.id); for (const nm of names) t.tags.push({ id: tagIds[nm.toLowerCase()], name: nm }); },
+    // As the real helper: the union of the task AS HANDED IN and the names, PUT as the whole set.
+    async addTaskTags(task, ...names) { const t = db.tasks.get(task.id); const set = [...(task.tags || []).map(x => ({ ...x }))]; for (const nm of names) if (!set.some(x => x.id === tagIds[nm.toLowerCase()])) set.push({ id: tagIds[nm.toLowerCase()], name: nm }); t.tags = set; },
     async assignResolvedOwner(id, { requesterEmail, keep = [] }) { db.tasks.get(id).assignees = [...keep, requesterEmail === HOST ? HOST_ID : "id-fallback"].map(x => ({ id: x })); return {}; },
     async appendTaskNote(id, text) { const t = db.tasks.get(id); t.details += `\n[agent] ${text}`; },
     // A comment does NOT touch details — that is the point of the move, so the
@@ -279,6 +282,9 @@ const tokenOf = url => url.split("/manage/")[1];
   // The reschedule is recorded as a COMMENT, not appended to the brief.
   assert.match((task.comments || []).map(c => c.content).join("\n"), /moved this meeting from Tue 22 Sep 2026, 09:00 \(Europe\/Lisbon\) to Tue 22 Sep 2026, 14:00/);
   assert.doesNotMatch(String(task.details || ""), /moved this meeting from/, "the task's own description is left alone");
+  assert.match(task.details, /^When: Tue 22 Sep 2026, 14:00 to 14:30 \(Europe\/Lisbon\)$/m, "its When line moves with it, so the App Kit reads the new time");
+  assert.doesNotMatch(task.details, /09:00/, "and the old time is gone");
+  assert.deepEqual(task.tags.map(t => t.name.toLowerCase()), ["meeting"], "a booking's task is a meeting (the App Kit's Meetings reads the tag)");
   assert(h.noan.db.memos.some(x => x.title === `booking:${row.id}:reschedule:${TUE_1400}`));
   ok("reschedule: off-grid refused; moves the row, the event, the task's due date and title; memo + note");
 
@@ -287,6 +293,7 @@ const tokenOf = url => url.split("/manage/")[1];
   assert.equal(h.calendar.events.size, 0, "the Google event is cancelled");
   await h.core._syncNoan(row.id);
   assert.equal(task.status, "done"); assert.equal(task.completed, true);
+  assert.deepEqual(task.tags, [], "a cancelled call is no meeting: the Meeting tag is off");
   assert.match((task.comments || []).map(c => c.content).join("\n"), /cancelled this meeting\. Their reason \(unverified\): Something came up\.$/m, "one full stop, even when the guest typed one");
   assert.equal((await h.core.cancel(token)).status, "cancelled", "cancelling twice is fine");
   assert.equal((await h.attempt(() => h.core.reschedule(token, TUE_0930))).status, 409);
@@ -304,18 +311,50 @@ const tokenOf = url => url.split("/manage/")[1];
   const tasks = [...h.noan.db.tasks.values()];
   const introTask = tasks.find(t => t.title.startsWith("Intro"));
   const quickTask = tasks.find(t => t.title.startsWith("Quick"));
-  assert.deepEqual(introTask.tags.map(t => t.name), ["Deck"]);
+  assert.deepEqual(introTask.tags.map(t => t.name.toLowerCase()).sort(), ["deck", "meeting"]);
   assert.deepEqual(introTask.assignees.map(a => a.id), [VERITY, HOST_ID]);
   assert.doesNotMatch(introTask.details, /Respond by/, "an agent-routed task is the agent's to work");
-  assert.deepEqual(quickTask.tags, []);
+  assert.deepEqual(quickTask.tags.map(t => t.name.toLowerCase()), ["meeting"]);
   assert.deepEqual(quickTask.assignees.map(a => a.id), [VERITY, HOST_ID]);
-  ok("on book: `task tag Deck` → tagged + agent + host; `task owner verity` → agent + host, untagged (the general agent)");
+  ok("on book: `task tag Deck` → tagged + agent + host; `task owner verity` → agent + host, no trigger tag (the general agent); both tagged Meeting");
 
   await h.core.cancel(tokenOf(intro.data.manageUrl));
   for (const r of await h.store.listPending(10)) await h.core._syncNoan(r.id);
-  assert.deepEqual(introTask.tags.map(t => t.name), ["Deck", "reengage"]);
+  assert.deepEqual(introTask.tags.map(t => t.name), ["Deck", "reengage"], "handed on without the Meeting tag");
   assert.notEqual(introTask.status, "done");
   ok("on cancel: `task tag reengage` hands the task to that agent instead of closing it");
+}
+
+/* ================= the Meeting tag never costs a booking ================= */
+{
+  // The tag listing down: the booking still files its task with the host on it, untagged, and a cancel still closes it.
+  const h = harness();
+  h.noan.api.findTagId = async () => { throw new Error("tags endpoint down"); };
+  const r = await h.book(demo());
+  assert.equal(r.status, 201);
+  const row = (await h.store.listConfirmedBetween(HOST, TUE_0900, "2026-09-23T00:00:00Z"))[0];
+  await h.core._syncNoan(row.id);
+  const id = (await h.store.get(row.id)).noan_task_id;
+  const task = h.noan.db.tasks.get(id);
+  assert(task, "the task is filed");
+  assert.deepEqual(task.tags, [], "untagged, never blocked");
+  assert.deepEqual(task.assignees.map(a => a.id), [HOST_ID], "the host is still put on it");
+  h.noan.api.findTaskById = async () => { throw new Error("board read down"); };
+  await h.core.cancel(tokenOf(r.data.manageUrl));
+  for (const x of await h.store.listPending(10)) await h.core._syncNoan(x.id);
+  assert.equal(task.status, "done", "a failed Meeting untag never stops the close");
+  assert.equal((task.comments || []).length, 1, "and the cancel note is posted once");
+  ok("Meeting tag: a failed lookup or board read never blocks the owner, the close, or posts the note twice");
+}
+{
+  // The When line: only the head's moves; the guest's answers, the routing lines and the cap are never touched.
+  const d = ["Demo with Ann (ann@x.test)", "When: Tue 22 Sep 2026, 09:00 to 09:30 (Europe/Lisbon)", "", "Guest answers (written by the guest, unverified):", "- Note: When: Fri 1 Jan 2027, 10:00", "", "Contact ID: c1", "Source: booking:b1"].join("\n");
+  const moved = movedWhen(d, "Tue 22 Sep 2026, 14:00 to 14:30 (Europe/Lisbon)");
+  assert.equal(moved, d.replace("09:00 to 09:30", "14:00 to 14:30"));
+  assert.equal(movedWhen(d, "Tue 22 Sep 2026, 09:00 to 09:30 (Europe/Lisbon)"), null, "nothing to change");
+  assert.equal(movedWhen("Guest answers (written by the guest, unverified):\n- x\nWhen: Fri", "y"), null, "a When line only in the guest's answers is never rewritten");
+  assert.equal(movedWhen(d.padEnd(2000, "x"), "Tue 22 Sep 2026, 14:00 to 14:30 (Europe/Lisbon), longer"), null, "a rewrite past the cap is left out, never cut");
+  ok("movedWhen: the head's When line only, never past the cap");
 }
 
 /* ================= failures: calendar, the lost reply, stuck, the race with a reschedule ================= */
@@ -774,6 +813,23 @@ blocked dates: christmas
   await crm2.apply({ ...row, id: "bd3" }, type, { kind: "book" }, async () => {});
   assert.equal(broken.db.tasks.size, 1, "a failed duplicate check never holds up the booking");
   ok("the duplicate check is fail-soft");
+}
+
+/* ========= a booking hands its guest to the company profiler once its own writes are done ========= */
+{
+  const noan = fakeNoan();
+  const seen = [];
+  const profiler = { profile: (row, contactId, contact) => seen.push({ row: row.id, contactId, tasks: noan.db.tasks.size, memos: contact.memos }) };
+  const crm = createNoanCrm({ api: noan.api, verityId: VERITY, timeZone: avail.timeZone, log: () => {}, profiler });
+  const row = { id: "bp1", guest_email: "ana@acme.example", guest_name: "Ana", start_at: "2026-09-16T16:30:00Z",
+                end_at: "2026-09-16T17:00:00Z", answers: [], attempts: 0, host_email: HOST };
+  await crm.apply(row, TYPES.types[0], { kind: "book" }, async () => {});
+  const guest = [...noan.db.contacts.values()][0];
+  assert.deepEqual(seen.map(s => [s.row, s.contactId, s.tasks]), [["bp1", guest.id, 1]], "called once, with the guest's contact, after the task is filed");
+  assert(Array.isArray(seen[0].memos), "with the contact as read back, memos included");
+  await crm.apply({ ...row, id: "bp2" }, TYPES.types[0], { kind: "reschedule", from: row.start_at, to: row.start_at });
+  assert.equal(seen.length, 1, "only a book item profiles");
+  ok("a booking hands its guest to the company profiler after the task is filed");
 }
 
 console.log("\nbooking core: all passed");

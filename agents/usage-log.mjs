@@ -114,6 +114,21 @@ function entryAgent() {
   } catch { return "unknown"; }
 }
 
+/* Where the ledger lives. The fleet's SUPABASE_* IS the ledger project, so nothing
+ * changes for a workflow. A hosted service whose SUPABASE_* is its own state store
+ * (the Slack app: tenants, sessions, drafts) names the ledger separately with
+ * USAGE_SUPABASE_URL / USAGE_SUPABASE_SERVICE_ROLE_KEY. Until 2026-10-13 the Slack
+ * app wrote its rows to its own project, which has no api_usage table, so every
+ * model call it made was invisible to the spend report (usage-log fails soft).
+ * The pair is taken whole: half of it set must never send one project's service
+ * key to another project's URL. */
+export function ledgerTarget(env = process.env) {
+  const own = env.USAGE_SUPABASE_URL && env.USAGE_SUPABASE_SERVICE_ROLE_KEY;
+  const url = own ? env.USAGE_SUPABASE_URL : env.SUPABASE_URL;
+  const key = own ? env.USAGE_SUPABASE_SERVICE_ROLE_KEY : env.SUPABASE_SERVICE_ROLE_KEY;
+  return { base: (url || "").replace(/\/$/, ""), key: key || "" };
+}
+
 let ctx = {};
 
 /** Module-level label override — the demo pipeline sets
@@ -139,8 +154,7 @@ export function setUsageContext(next = {}) {
 export async function recordUsage({ agent, action, provider, model, usage, units, costUsd, at } = {}) {
   try {
     if (process.env.USAGE_LOG === "0") return;
-    const base = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    const { base, key } = ledgerTarget();
     if (!base || !key || !provider) return;
 
     const row = {
@@ -177,6 +191,16 @@ export async function recordUsage({ agent, action, provider, model, usage, units
   }
 }
 
+// For callers with someone waiting on them. The row is built before the first await, so it keeps the caller's usage context.
+const pendingRows = new Set();
+export function recordUsageSoon(args) {
+  const p = recordUsage(args).finally(() => pendingRows.delete(p));
+  pendingRows.add(p);
+}
+export async function flushUsage() {
+  await Promise.allSettled([...pendingRows]);
+}
+
 /**
  * All rows with since <= at < until (ISO strings), oldest first. Paginates in
  * 1000-row pages. THROWS on error — only spend-worker calls this, and a failed
@@ -193,9 +217,8 @@ export function rowCost(row) {
 }
 
 export async function readUsage({ since, until } = {}) {
-  const base = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!base || !key) throw new Error("usage-log: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY required");
+  const { base, key } = ledgerTarget();
+  if (!base || !key) throw new Error("usage-log: USAGE_SUPABASE_URL / USAGE_SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY) required");
 
   const rows = [];
   for (let offset = 0; ; offset += 1000) {
